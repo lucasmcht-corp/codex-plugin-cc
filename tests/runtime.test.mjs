@@ -23,7 +23,10 @@ import {
   upsertJob
 } from "../plugins/codex/scripts/lib/state.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
-import { inspectProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
+import {
+  inspectOwnedWorker,
+  inspectProcessIdentity
+} from "../plugins/codex/scripts/lib/process.mjs";
 import { enqueueOwnedJob } from "../plugins/codex/scripts/codex-companion.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -3892,7 +3895,9 @@ test("session end rejects a background job published after the final scan", asyn
   );
 });
 
-test("session end stops multiple resistant workers within one shutdown window", async (t) => {
+// The shutdown window is budget-bounded by design (FORK_MAINTENANCE invariants 12 and 18), so a
+// partial drain is contractual: see the vault task 2026-07-24-flakes-integration-codex-plugin-cc.
+test("session end drains resistant workers within its bounded shutdown window without losing a job", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "term-resistant-slow-task");
@@ -3949,8 +3954,57 @@ test("session end stops multiple resistant workers within one shutdown window", 
 
   assert.equal(result.timedOut, false);
   assert.equal(result.status, 0, result.stderr);
+
+  const remaining = loadState(repo).jobs.filter(
+    (job) => job.sessionId === "sess-many"
+  );
+  const drained = runningJobs.filter(
+    (job) => !remaining.some((candidate) => candidate.id === job.id)
+  );
+
+  for (const job of drained) {
+    assert.equal(
+      inspectOwnedWorker(job.worker).status,
+      "gone",
+      `drained job ${job.id} left its worker alive`
+    );
+  }
+
+  for (const job of remaining) {
+    if (job.status === "running") {
+      assert.ok(
+        job.worker?.token,
+        `running job ${job.id} lost the worker identity it needs to be reconciled`
+      );
+    }
+  }
+
+  for (const job of remaining) {
+    if (job.worker) {
+      forceStopTestWorker(job.worker);
+    }
+  }
+
+  for (const job of remaining) {
+    if (job.worker) {
+      await waitFor(() => inspectOwnedWorker(job.worker).status === "gone");
+    }
+    const reconciled = run("node", [SCRIPT, "status", job.id, "--json"], {
+      cwd: repo,
+      env
+    });
+    assert.equal(reconciled.status, 0, reconciled.stderr);
+    const reconciledStatus = JSON.parse(reconciled.stdout).job.status;
+    assert.ok(
+      reconciledStatus === "failed" || reconciledStatus === "completed",
+      `job ${job.id} stayed ${reconciledStatus} after its worker died`
+    );
+  }
+
   assert.equal(
-    loadState(repo).jobs.some((job) => job.sessionId === "sess-many"),
+    loadState(repo).jobs.some(
+      (job) => job.sessionId === "sess-many" && job.status === "running"
+    ),
     false
   );
 });
