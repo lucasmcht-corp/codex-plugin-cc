@@ -132,7 +132,9 @@ test("collectReviewContext skips untracked directories in working tree review", 
   assert.match(context.content, /### \.claude\/worktrees\/agent-test\/\n\(skipped: directory\)/);
 });
 
-test("collectReviewContext skips broken untracked symlinks instead of crashing", () => {
+test("collectReviewContext skips broken untracked symlinks instead of crashing", {
+  skip: process.platform === "win32"
+}, () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
   fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
@@ -145,7 +147,101 @@ test("collectReviewContext skips broken untracked symlinks instead of crashing",
 
   assert.equal(target.mode, "working-tree");
   assert.match(context.content, /### broken-link/);
-  assert.match(context.content, /skipped: broken symlink or unreadable file/i);
+  assert.match(context.content, /skipped: symbolic link/i);
+});
+
+test("collectReviewContext never reads an untracked symlink target outside the repository", {
+  skip: process.platform === "win32"
+}, () => {
+  const cwd = makeTempDir();
+  const outside = makeTempDir();
+  const outsideFile = path.join(outside, "private.txt");
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(outsideFile, "OUTSIDE_REPOSITORY_SECRET\n");
+  fs.symlinkSync(outsideFile, path.join(cwd, "outside-link"));
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(target.mode, "working-tree");
+  assert.match(context.content, /### outside-link/);
+  assert.match(context.content, /skipped: symbolic link/i);
+  assert.doesNotMatch(context.content, /OUTSIDE_REPOSITORY_SECRET/);
+});
+
+test("collectReviewContext deterministically caps aggregate untracked files and bytes", () => {
+  const countRepo = makeTempDir();
+  initGitRepo(countRepo);
+  fs.writeFileSync(path.join(countRepo, "tracked.js"), "export {};\n");
+  run("git", ["add", "tracked.js"], { cwd: countRepo });
+  run("git", ["commit", "-m", "init"], { cwd: countRepo });
+  for (let index = 0; index < 25; index += 1) {
+    const suffix = String(index).padStart(2, "0");
+    fs.writeFileSync(
+      path.join(countRepo, `count-${suffix}.txt`),
+      `COUNT_CONTENT_${suffix}\n`
+    );
+  }
+
+  const countTarget = resolveReviewTarget(countRepo, {});
+  const firstCountContext = collectReviewContext(countRepo, countTarget);
+  const secondCountContext = collectReviewContext(countRepo, countTarget);
+
+  assert.equal(firstCountContext.content, secondCountContext.content);
+  assert.equal(
+    [...firstCountContext.content.matchAll(/^### count-/gm)].length,
+    20
+  );
+  for (let index = 0; index < 20; index += 1) {
+    assert.match(
+      firstCountContext.content,
+      new RegExp(`COUNT_CONTENT_${String(index).padStart(2, "0")}`)
+    );
+  }
+  assert.doesNotMatch(firstCountContext.content, /COUNT_CONTENT_20/);
+  assert.match(
+    firstCountContext.content,
+    /omitted: 5 additional untracked file\(s\).*20 files.*98304 bytes/
+  );
+
+  const byteRepo = makeTempDir();
+  initGitRepo(byteRepo);
+  fs.writeFileSync(path.join(byteRepo, "tracked.js"), "export {};\n");
+  run("git", ["add", "tracked.js"], { cwd: byteRepo });
+  run("git", ["commit", "-m", "init"], { cwd: byteRepo });
+  const fileBytes = 12 * 1024;
+  for (let index = 0; index < 12; index += 1) {
+    const suffix = String(index).padStart(2, "0");
+    const marker = `BYTE_CONTENT_${suffix}\n`;
+    fs.writeFileSync(
+      path.join(byteRepo, `bytes-${suffix}.txt`),
+      marker + "x".repeat(fileBytes - Buffer.byteLength(marker))
+    );
+  }
+
+  const byteTarget = resolveReviewTarget(byteRepo, {});
+  const byteContext = collectReviewContext(byteRepo, byteTarget);
+  const untrackedHeading = "## Untracked Files\n\n";
+  const untrackedBody = byteContext.content.slice(
+    byteContext.content.indexOf(untrackedHeading) + untrackedHeading.length
+  ).trimEnd();
+
+  assert.equal([...byteContext.content.matchAll(/^### bytes-/gm)].length, 7);
+  assert.ok(Buffer.byteLength(untrackedBody, "utf8") <= 96 * 1024);
+  for (let index = 0; index < 7; index += 1) {
+    assert.match(
+      byteContext.content,
+      new RegExp(`BYTE_CONTENT_${String(index).padStart(2, "0")}`)
+    );
+  }
+  assert.doesNotMatch(byteContext.content, /BYTE_CONTENT_07/);
+  assert.match(
+    byteContext.content,
+    /omitted: 5 additional untracked file\(s\).*20 files.*98304 bytes/
+  );
 });
 
 test("collectReviewContext falls back to lightweight context for larger adversarial reviews", () => {
