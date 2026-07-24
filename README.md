@@ -81,7 +81,7 @@ One simple first run is:
 ```bash
 /codex:review --background
 /codex:status
-/codex:result
+/codex:result review-abc123
 ```
 
 ## Activate this checkout without installing it
@@ -249,12 +249,14 @@ Use it to:
 ### `/codex:result`
 
 Shows the final stored Codex output for a finished job.
+The job ID is always required: the command never falls back to the latest or the
+only finished job. Any Claude session holding the job ID can read it, including a
+session started after the one that launched the job.
 When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
 
-Examples:
+Example:
 
 ```bash
-/codex:result
 /codex:result task-abc123
 ```
 
@@ -271,18 +273,19 @@ raw arguments directly and never interpolates them into a shell.
 /codex:send task-abc123 focus on the failing tests first
 ```
 
-The command fails when the job is not a running task from the current Claude
-session, when its owned worker generation changed, or when the active turn is no
-longer available.
+The command fails when the job is not a running task, when its owned worker
+generation changed, or when the active turn is no longer available. It does not
+require the Claude session that launched the job.
 
 ### `/codex:cancel`
 
 Cancels an active background Codex job.
+The job ID is always required: the command never cancels the only active job or
+the latest one by default. Any Claude session holding the job ID can cancel it.
 
-Examples:
+Example:
 
 ```bash
-/codex:cancel
 /codex:cancel task-abc123
 ```
 
@@ -331,7 +334,7 @@ Then check in with:
 ```bash
 /codex:status
 /codex:send task-abc123 focus on the failing tests first
-/codex:result
+/codex:result task-abc123
 ```
 
 ## Codex Integration

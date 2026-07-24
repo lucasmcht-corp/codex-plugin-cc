@@ -209,6 +209,7 @@ test("transfer, result, send, and cancel commands are exposed as deterministic r
   assert.doesNotMatch(status, /\$ARGUMENTS|!\s*`/);
   assert.match(result, /disable-model-invocation:\s*true/);
   assert.match(result, /Codex command hook owns this command/i);
+  assert.match(result, /argument-hint:\s*'<job-id>'/);
   assert.doesNotMatch(result, /\$ARGUMENTS|!\s*`/);
   assert.match(send, /disable-model-invocation:\s*true/);
   assert.match(send, /Codex send hook owns this command/i);
@@ -216,6 +217,7 @@ test("transfer, result, send, and cancel commands are exposed as deterministic r
   assert.doesNotMatch(send, /!\s*`|\$ARGUMENTS|\$job|\$instruction/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
   assert.match(cancel, /Codex command hook owns this command/i);
+  assert.match(cancel, /argument-hint:\s*'<job-id>'/);
   assert.doesNotMatch(cancel, /\$ARGUMENTS|!\s*`/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);

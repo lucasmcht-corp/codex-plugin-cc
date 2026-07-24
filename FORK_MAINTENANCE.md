@@ -73,6 +73,20 @@ document and the repository history.
 21. Persistent state is exported only through
     `CODEX_COMPANION_PLUGIN_DATA`. The plugin-scoped `CLAUDE_PLUGIN_DATA`
     variable is never copied into the global Claude session environment.
+22. The trust boundary is the operating system user, not the Claude session:
+    every process of that user already reads `state.json` and therefore every
+    job id, so state directories are 0700 and state files 0600. A job is owned
+    by its id plus the worker generation proof, never by the Claude session that
+    launched it. `job.sessionId` scopes listings and the SessionEnd boundary
+    only, and never gates access to an explicit job id. The asymmetry is
+    deliberate: access is by id, lifecycle stays by session, so adopting a job
+    from another session never transfers the SessionEnd drain responsibility for
+    it.
+23. `status <id>`, `status --wait`, `result`, `send` and `cancel` require an
+    explicit job reference, matched by exact equality: no omitted reference is
+    resolved to the latest or the only candidate job, and no prefix is expanded.
+    The job id is not a secret and not a security capability; the explicit
+    reference is a coordination contract against acting on the wrong job.
 
 On Windows, opening a directory for synchronization may be unsupported. In that
 case canonical state is kept, but legacy terminal manifests are deliberately

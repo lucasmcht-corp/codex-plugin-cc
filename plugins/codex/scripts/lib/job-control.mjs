@@ -37,8 +37,9 @@ function getCurrentSessionId(options = {}) {
   return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
 }
 
+// Session scoping is listing visibility only, never an access condition on a job id.
 /** @param {JobRecord[]} jobs @param {JobSelectionOptions} [options] */
-function filterJobsForCurrentSession(jobs, options = {}) {
+function filterJobsForSessionVisibility(jobs, options = {}) {
   const sessionId = getCurrentSessionId(options);
   if (!sessionId) {
     return jobs;
@@ -218,38 +219,35 @@ export function readStoredJob(workspaceRoot, jobId) {
   );
 }
 
-/** @param {string} workspaceRoot @param {string} jobId @param {string} sessionId */
-export function readStoredSessionJob(workspaceRoot, jobId, sessionId) {
-  return (
-    listJobs(workspaceRoot).find(
-      /** @param {JobRecord} job */ (job) =>
-        job.id === jobId && job.sessionId === sessionId
-    ) ?? null
-  );
+/** @param {JobRecord[]} visibleJobs */
+function describeVisibleJobs(visibleJobs) {
+  if (visibleJobs.length === 0) {
+    return "No job is visible for this Claude session.";
+  }
+  const listed = visibleJobs
+    .slice(0, DEFAULT_MAX_STATUS_JOBS)
+    .map((job) => `${job.id} (${job.status})`)
+    .join(", ");
+  return `Visible jobs: ${listed}. Run /codex:status to inspect known jobs.`;
 }
 
 /**
  * @param {JobRecord[]} jobs
  * @param {string | null | undefined} reference
- * @param {(job: JobRecord) => boolean} [predicate]
+ * @param {JobRecord[]} visibleJobs
+ * @returns {JobRecord}
  */
-function matchJobReference(jobs, reference, predicate = () => true) {
-  const filtered = jobs.filter(predicate);
+function matchJobReference(jobs, reference, visibleJobs) {
   if (!reference) {
-    return filtered[0] ?? null;
+    throw new Error(
+      `An explicit job id is required. ${describeVisibleJobs(visibleJobs)}`
+    );
   }
 
-  const exact = filtered.find((job) => job.id === reference);
+  // Exact equality only: a prefix would let a short reference reach another session's job.
+  const exact = jobs.find((job) => job.id === reference);
   if (exact) {
     return exact;
-  }
-
-  const prefixMatches = filtered.filter((job) => job.id.startsWith(reference));
-  if (prefixMatches.length === 1) {
-    return prefixMatches[0];
-  }
-  if (prefixMatches.length > 1) {
-    throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
   }
 
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
@@ -259,7 +257,7 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(filterJobsForSessionVisibility(listJobs(workspaceRoot), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -291,7 +289,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
  * @param {{ maxProgressLines?: number }} [options]
  */
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
-  const { workspaceRoot, job: selected } = resolveSessionJob(
+  const { workspaceRoot, job: selected } = resolveRequestedJob(
     cwd,
     reference,
     options
@@ -304,46 +302,29 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 }
 
 /** @param {string} cwd @param {string | null | undefined} reference @param {JobSelectionOptions} [options] */
-export function resolveSessionJob(cwd, reference, options = {}) {
+export function resolveRequestedJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(
-    filterJobsForCurrentSession(listJobs(workspaceRoot), options)
-  );
-  const selected = matchJobReference(jobs, reference);
-  if (!selected) {
-    throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
-  }
-  return { workspaceRoot, job: selected };
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  return {
+    workspaceRoot,
+    job: matchJobReference(
+      jobs,
+      reference,
+      filterJobsForSessionVisibility(jobs, options)
+    )
+  };
 }
 
-/** @param {string} cwd @param {string | null | undefined} reference @param {JobSelectionOptions} [options] */
-export function resolveResultJob(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(
-    filterJobsForCurrentSession(listJobs(workspaceRoot), options)
-  );
-  const selected = matchJobReference(
-    jobs,
-    reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
-  );
-
-  if (selected) {
-    return { workspaceRoot, job: selected };
+/** @param {string} workspaceRoot @param {string} jobId */
+export function readFinishedJob(workspaceRoot, jobId) {
+  const job = readStoredJob(workspaceRoot, jobId);
+  if (!job) {
+    throw new Error(`No job found for "${jobId}". Run /codex:status to list known jobs.`);
   }
-
-  const active = matchJobReference(jobs, reference, (job) =>
-    isActiveJobStatus(job.status)
-  );
-  if (active) {
-    throw new Error(`Job ${active.id} is still ${active.status}. Check /codex:status and try again once it finishes.`);
+  if (isActiveJobStatus(job.status)) {
+    throw new Error(`Job ${job.id} is still ${job.status}. Check /codex:status and try again once it finishes.`);
   }
-
-  if (reference) {
-    throw new Error(`No finished job found for "${reference}". Run /codex:status to inspect active jobs.`);
-  }
-
-  throw new Error("No finished Codex jobs found for this repository yet.");
+  return job;
 }
 
 /**
@@ -353,37 +334,18 @@ export function resolveResultJob(cwd, reference, options = {}) {
  */
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const allActiveJobs = filterJobsForCurrentSession(
-    jobs.filter((job) => isActiveJobStatus(job.status)),
-    options
+  const activeJobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) =>
+    isActiveJobStatus(job.status)
   );
-  const activeJobs = allActiveJobs.filter(isCancellableJob);
-
-  if (reference) {
-    const activeJob = matchJobReference(allActiveJobs, reference);
-    if (activeJob && !isCancellableJob(activeJob)) {
-      throw new Error(
-        `Job ${activeJob.id} is active but is not an owned background worker and cannot be cancelled.`
-      );
-    }
-    const selected = matchJobReference(activeJobs, reference);
-    if (!selected) {
-      throw new Error(`No active job found for "${reference}".`);
-    }
-    return { workspaceRoot, job: selected };
+  const selected = matchJobReference(
+    activeJobs,
+    reference,
+    filterJobsForSessionVisibility(activeJobs, options)
+  );
+  if (!isCancellableJob(selected)) {
+    throw new Error(
+      `Job ${selected.id} is active but is not an owned background worker and cannot be cancelled.`
+    );
   }
-
-  if (activeJobs.length === 1) {
-    return { workspaceRoot, job: activeJobs[0] };
-  }
-  if (activeJobs.length > 1) {
-    throw new Error("Multiple Codex jobs are active. Pass a job id to /codex:cancel.");
-  }
-
-  if (getCurrentSessionId(options)) {
-    throw new Error("No active Codex jobs to cancel for this session.");
-  }
-
-  throw new Error("No active Codex jobs to cancel.");
+  return { workspaceRoot, job: selected };
 }
