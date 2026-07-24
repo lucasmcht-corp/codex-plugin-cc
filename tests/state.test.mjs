@@ -543,6 +543,10 @@ test("session-start reconciliation obeys its transaction deadline under a held l
     await assert.rejects(
       prepareSessionStart(workspace, {
         inspectOwnedWorkerImpl: () => ({ status: "gone" }),
+        // A frozen clock keeps the full recovery budget available at the reconcile
+        // loop, so scheduling jitter can never make it break out before it reaches
+        // the held state lock; withStateTransaction still times out on real time.
+        nowImpl: () => 1_000_000,
         sessionStartConfig: {
           recoveryBudgetMs: 75
         }

@@ -65,6 +65,42 @@ test("reconciliation fails an active job whose exact owned worker is gone", () =
   assert.match(state.current().errorMessage, /exited without publishing/i);
 });
 
+test("a dead owned worker skipped by an exhausted-budget SessionStart is still failed at the status boundary, never left running", async () => {
+  const state = createReconciliationState({
+    id: "dead-owned-worker-budget-skip",
+    status: "running",
+    pid: 1234,
+    worker: makePosixWorker()
+  });
+  const inspectOwnedWorkerImpl = () => ({ status: "gone" });
+
+  // The first now() sets deadlineAt; every later call is past it, so SessionStart
+  // exhausts its budget before its reconcile loop reaches the job and leaves the
+  // dead owned worker untouched (partial recovery, FORK_MAINTENANCE invariant 18).
+  let nowCalls = 0;
+  await prepareSessionStart("workspace", {
+    ...state,
+    loadStateImpl: () => ({ endedSessions: [] }),
+    inspectOwnedWorkerImpl,
+    nowImpl: () => (nowCalls++ === 0 ? 1000 : 5000),
+    sessionStartConfig: { recoveryBudgetMs: 3500 }
+  });
+  assert.equal(state.current().status, "running");
+
+  // The status boundary reconciles without a budget, so a dead owned worker is
+  // exposed as a terminal failure and never reported as running (invariant 9).
+  reconcileWorkspaceJobs("workspace", {
+    ...state,
+    inspectOwnedWorkerImpl,
+    jobIds: [state.current().id]
+  });
+
+  assert.equal(state.current().status, "failed");
+  assert.equal(state.current().worker, null);
+  assert.equal(state.current().pid, null);
+  assert.match(state.current().errorMessage, /exited without publishing/i);
+});
+
 test("session cleanup refuses an unknown status without removing its worker record", async () => {
   const invalidJob = {
     id: "invalid-status",
