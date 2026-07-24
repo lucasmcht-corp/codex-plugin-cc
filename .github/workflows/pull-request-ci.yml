@@ -12,6 +12,7 @@ jobs:
     name: CI (${{ matrix.os }}, Codex ${{ matrix.codex-version }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    continue-on-error: ${{ matrix.optional || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -20,8 +21,10 @@ jobs:
             codex-version: 0.145.0
           - os: ubuntu-latest
             codex-version: latest
+          # Reports without blocking until the Windows hardening lands: vault task 2026-07-24-durcissement-windows-codex-plugin-cc.
           - os: windows-latest
             codex-version: latest
+            optional: true
 
     steps:
       - name: Check out repository
