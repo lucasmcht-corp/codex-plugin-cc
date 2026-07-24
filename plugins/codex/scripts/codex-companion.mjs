@@ -54,11 +54,10 @@ import {
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  readFinishedJob,
   readStoredJob,
-  readStoredSessionJob,
   resolveCancelableJob,
-  resolveResultJob,
-  resolveSessionJob,
+  resolveRequestedJob,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
 import {
@@ -166,7 +165,6 @@ import {
  *
  * @typedef {object} ExecuteSendInput
  * @property {string} cwd
- * @property {string | null} sessionId
  * @property {string} jobId
  * @property {string} instruction
  *
@@ -230,21 +228,13 @@ function reconcileWorkspaceRuntime(workspaceRoot) {
   });
 }
 
-/** @param {string} workspaceRoot @param {string} jobId @param {string | null} [sessionId] */
-function reconcileJobRuntime(
-  workspaceRoot,
-  jobId,
-  sessionId = getCurrentClaudeSessionId()
-) {
-  if (
-    sessionId &&
-    !readStoredSessionJob(workspaceRoot, jobId, sessionId)
-  ) {
-    throw new Error(`No stored job found for ${jobId} in the current Claude session.`);
+/** @param {string} workspaceRoot @param {string} jobId */
+function reconcileJobRuntime(workspaceRoot, jobId) {
+  if (!readStoredJob(workspaceRoot, jobId)) {
+    throw new Error(`No stored job found for ${jobId}.`);
   }
   reconcileWorkspaceJobs(workspaceRoot, {
     steeringConfig: RUNTIME_CONFIG.steering,
-    ...(sessionId ? { sessionId } : {}),
     jobIds: [jobId]
   });
 }
@@ -259,9 +249,9 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs result <job-id> [--json]",
       "  node scripts/codex-companion.mjs send <job-id> <instruction> [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel <job-id> [--json]"
     ].join("\n")
   );
 }
@@ -821,9 +811,9 @@ async function waitForTrackedJob(cwd, reference, options = {}) {
         );
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = timeoutMs === null ? null : Date.now() + timeoutMs;
-  const authorized = resolveSessionJob(cwd, reference);
-  const workspaceRoot = authorized.workspaceRoot;
-  const jobId = authorized.job.id;
+  const requested = resolveRequestedJob(cwd, reference);
+  const workspaceRoot = requested.workspaceRoot;
+  const jobId = requested.job.id;
   reconcileJobRuntime(workspaceRoot, jobId);
   let snapshot = buildSingleJobSnapshot(cwd, jobId);
 
@@ -1785,9 +1775,9 @@ async function handleStatus(argv) {
         pollIntervalMs: readNumberOption(options, "poll-interval-ms")
       });
     } else {
-      const authorized = resolveSessionJob(cwd, reference);
-      reconcileJobRuntime(authorized.workspaceRoot, authorized.job.id);
-      snapshot = buildSingleJobSnapshot(cwd, authorized.job.id);
+      const requested = resolveRequestedJob(cwd, reference);
+      reconcileJobRuntime(requested.workspaceRoot, requested.job.id);
+      snapshot = buildSingleJobSnapshot(cwd, requested.job.id);
     }
     outputCommandResult(
       snapshot,
@@ -1815,16 +1805,10 @@ function handleResult(argv) {
   });
 
   const cwd = resolveCommandCwd(options);
-  const reference = positionals[0] ?? "";
-  let authorizedReference = reference;
-  if (reference) {
-    const authorized = resolveSessionJob(cwd, reference);
-    reconcileJobRuntime(authorized.workspaceRoot, authorized.job.id);
-    authorizedReference = authorized.job.id;
-  } else {
-    reconcileWorkspaceRuntime(resolveCommandWorkspace(options));
-  }
-  const { workspaceRoot, job } = resolveResultJob(cwd, authorizedReference);
+  const requested = resolveRequestedJob(cwd, positionals[0] ?? "");
+  const workspaceRoot = requested.workspaceRoot;
+  reconcileJobRuntime(workspaceRoot, requested.job.id);
+  const job = readFinishedJob(workspaceRoot, requested.job.id);
   const storedJob = job;
   const payload = {
     job,
@@ -1839,7 +1823,7 @@ function handleResult(argv) {
 }
 
 /** @param {ExecuteSendInput} input */
-async function executeSend({ cwd, sessionId, jobId, instruction }) {
+async function executeSend({ cwd, jobId, instruction }) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   if (!jobId) {
     throw new Error("`send` requires an explicit background job id.");
@@ -1847,17 +1831,14 @@ async function executeSend({ cwd, sessionId, jobId, instruction }) {
   if (!instruction.trim()) {
     throw new Error("`send` requires a non-empty instruction.");
   }
-  if (!sessionId) {
-    throw new Error("Cannot steer without the current Claude session id.");
-  }
-  let job = readStoredSessionJob(workspaceRoot, jobId, sessionId);
+  let job = readStoredJob(workspaceRoot, jobId);
   if (!job) {
-    throw new Error(`No stored job found for ${jobId} in the current Claude session.`);
+    throw new Error(`No stored job found for ${jobId}.`);
   }
-  reconcileJobRuntime(workspaceRoot, job.id, sessionId);
-  job = readStoredSessionJob(workspaceRoot, job.id, sessionId);
+  reconcileJobRuntime(workspaceRoot, job.id);
+  job = readStoredJob(workspaceRoot, job.id);
   if (!job) {
-    throw new Error(`No stored job found for ${jobId} in the current Claude session.`);
+    throw new Error(`No stored job found for ${jobId}.`);
   }
   if (job.jobClass !== "task" || job.status !== "running") {
     throw new Error(`Cannot steer ${job.id}: it is not a running background task.`);
@@ -1930,7 +1911,6 @@ async function handleSend(argv) {
   const cwd = resolveCommandCwd(options);
   const payload = await executeSend({
     cwd,
-    sessionId: getCurrentClaudeSessionId(),
     jobId: positionals[0]?.trim() ?? "",
     instruction: positionals[1] ?? ""
   });
@@ -1971,7 +1951,6 @@ async function handleSendHook() {
     const { jobId, instruction } = parseSendHookArguments(input.command_args);
     const payload = await executeSend({
       cwd: input.cwd,
-      sessionId: input.session_id,
       jobId,
       instruction
     });

@@ -2232,7 +2232,7 @@ test("a failed active turn removes its steering endpoint and descriptor", async 
   }
 });
 
-test("send rejects foreign sessions, stale generations, and dead workers", async (t) => {
+test("send serves a foreign session holding the job id, and rejects stale generations and dead workers", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const steeringRoot = makeTempDir();
@@ -2275,8 +2275,21 @@ test("send rejects foreign sessions, stale generations, and dead workers", async
     [SCRIPT, "send", jobId, "--json", "foreign instruction"],
     { cwd: repo, env: foreignEnv }
   );
-  assert.equal(foreignSend.status, 1);
-  assert.match(foreignSend.stderr, /current Claude session/i);
+  assert.equal(foreignSend.status, 0, foreignSend.stderr);
+  const foreignPayload = JSON.parse(foreignSend.stdout);
+  assert.equal(foreignPayload.jobId, jobId);
+  assert.equal(foreignPayload.status, "accepted");
+  assert.equal(foreignPayload.threadId, runningJob.threadId);
+
+  const detachedEnv = { ...ownerEnv };
+  delete detachedEnv.CODEX_COMPANION_SESSION_ID;
+  const detachedSend = run(
+    "node",
+    [SCRIPT, "send", jobId, "--json", "detached instruction"],
+    { cwd: repo, env: detachedEnv }
+  );
+  assert.equal(detachedSend.status, 0, detachedSend.stderr);
+  assert.equal(JSON.parse(detachedSend.stdout).status, "accepted");
 
   const originalSteering = runningJob.steering;
   const staleWorker = {
@@ -2869,7 +2882,7 @@ test("status without a job id only shows jobs from the current Claude session", 
   );
 });
 
-test("targeted status, wait, and result authorize the session before reading or reconciling", () => {
+test("targeted status, wait, and result serve a job id held by any session and reconcile it first", () => {
   const workspace = makeTempDir();
   initGitRepo(workspace);
   const deadLauncher = {
@@ -2893,14 +2906,22 @@ test("targeted status, wait, and result authorize the session before reading or 
     launcher: deadLauncher
   });
   upsertJob(workspace, {
+    id: "task-foreign-wait",
+    status: "queued",
+    jobClass: "task",
+    sessionId: "sess-foreign",
+    launchToken: "launch-foreign-wait",
+    launcher: deadLauncher
+  });
+  upsertJob(workspace, {
     id: "task-foreign-result",
     status: "completed",
     jobClass: "task",
     sessionId: "sess-foreign",
-    rendered: "FOREIGN_RESULT_MUST_NOT_BE_READ",
+    rendered: "FOREIGN_RESULT_READ_BY_JOB_ID",
     result: {
       codex: {
-        stdout: "FOREIGN_RESULT_MUST_NOT_BE_READ"
+        stdout: "FOREIGN_RESULT_READ_BY_JOB_ID"
       }
     }
   });
@@ -2922,31 +2943,113 @@ test("targeted status, wait, and result authorize the session before reading or 
     "queued"
   );
 
-  for (const args of [
-    ["status", "task-foreign-dead", "--json"],
-    [
-      "status",
-      "task-foreign-dead",
-      "--wait",
-      "--timeout-ms",
-      "25",
-      "--json"
-    ],
-    ["result", "task-foreign-result", "--json"]
+  const detachedEnv = { ...process.env };
+  delete detachedEnv.CODEX_COMPANION_SESSION_ID;
+  const restartedEnv = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: "sess-restarted"
+  };
+
+  for (const [caller, callerEnv] of [
+    ["without any session id", detachedEnv],
+    ["from a restarted session", restartedEnv]
   ]) {
-    const before = loadState(workspace).jobs;
-    const denied = run("node", [SCRIPT, ...args], {
-      cwd: workspace,
-      env
-    });
-    assert.equal(denied.status, 1);
-    assert.match(denied.stderr, /No job found|current Claude session/i);
-    assert.doesNotMatch(
-      `${denied.stdout}\n${denied.stderr}`,
-      /FOREIGN_RESULT_MUST_NOT_BE_READ/
+    const foreignStatus = run(
+      "node",
+      [SCRIPT, "status", "task-foreign-dead", "--json"],
+      { cwd: workspace, env: callerEnv }
     );
-    assert.deepEqual(loadState(workspace).jobs, before);
+    assert.equal(foreignStatus.status, 0, `status ${caller}: ${foreignStatus.stderr}`);
+    assert.equal(JSON.parse(foreignStatus.stdout).job.status, "failed");
+
+    const foreignWait = run(
+      "node",
+      [SCRIPT, "status", "task-foreign-wait", "--wait", "--timeout-ms", "25", "--json"],
+      { cwd: workspace, env: callerEnv }
+    );
+    assert.equal(foreignWait.status, 0, `wait ${caller}: ${foreignWait.stderr}`);
+    const waited = JSON.parse(foreignWait.stdout);
+    assert.equal(waited.job.status, "failed");
+    assert.equal(waited.waitTimedOut, false);
+
+    const foreignResult = run(
+      "node",
+      [SCRIPT, "result", "task-foreign-result", "--json"],
+      { cwd: workspace, env: callerEnv }
+    );
+    assert.equal(foreignResult.status, 0, `result ${caller}: ${foreignResult.stderr}`);
+    assert.equal(
+      JSON.parse(foreignResult.stdout).job.result.codex.stdout,
+      "FOREIGN_RESULT_READ_BY_JOB_ID"
+    );
   }
+});
+
+test("status, result, send, and cancel refuse an omitted or unknown job reference", () => {
+  const workspace = makeTempDir();
+  initGitRepo(workspace);
+  upsertJob(workspace, {
+    id: "job-visible-done",
+    status: "completed",
+    jobClass: "review",
+    sessionId: "sess-current",
+    rendered: "IMPLICIT_RESOLUTION_MUST_NOT_HAPPEN",
+    result: {
+      codex: {
+        stdout: "IMPLICIT_RESOLUTION_MUST_NOT_HAPPEN"
+      }
+    }
+  });
+  upsertJob(workspace, {
+    id: "job-visible-active",
+    ...activeLauncherFields(),
+    jobClass: "task",
+    sessionId: "sess-current"
+  });
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: "sess-current"
+  };
+
+  for (const args of [
+    ["status", "--wait", "--timeout-ms", "25", "--json"],
+    ["result", "--json"],
+    ["cancel", "--json"],
+    ["send", "--json"]
+  ]) {
+    const refused = run("node", [SCRIPT, ...args], { cwd: workspace, env });
+    assert.equal(refused.status, 1, `${args[0]} resolved an omitted job reference`);
+    assert.match(
+      refused.stderr,
+      /An explicit job id is required\.|requires a job id|requires an explicit background job id/
+    );
+    assert.doesNotMatch(
+      `${refused.stdout}\n${refused.stderr}`,
+      /IMPLICIT_RESOLUTION_MUST_NOT_HAPPEN/
+    );
+  }
+
+  for (const args of [
+    ["status", "job-unknown", "--json"],
+    ["result", "job-unknown", "--json"],
+    ["cancel", "job-unknown", "--json"],
+    ["send", "job-unknown", "--json", "instruction"]
+  ]) {
+    const refused = run("node", [SCRIPT, ...args], { cwd: workspace, env });
+    assert.equal(refused.status, 1, `${args[0]} accepted an unknown job id`);
+    assert.match(
+      refused.stderr,
+      /No job found for "job-unknown"|No stored job found for job-unknown/
+    );
+  }
+
+  assert.deepEqual(
+    loadState(workspace).jobs.map((job) => [job.id, job.status]).sort(),
+    [
+      ["job-visible-active", "queued"],
+      ["job-visible-done", "completed"]
+    ]
+  );
 });
 
 test("status preserves adversarial review kind labels", () => {
@@ -3090,7 +3193,7 @@ test("status rejects a wait deadline longer than its host hook budget", () => {
   assert.match(result.stderr, /--timeout-ms must be an integer from 1 to 780000/i);
 });
 
-test("result returns the stored output for the latest finished job by default", () => {
+test("result returns the stored output for an explicit job id", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
@@ -3127,7 +3230,7 @@ test("result returns the stored output for the latest finished job by default", 
     { encoding: "utf8", mode: 0o600 }
   );
 
-  const result = run("node", [SCRIPT, "result"], {
+  const result = run("node", [SCRIPT, "result", "review-finished"], {
     cwd: workspace
   });
 
@@ -3136,9 +3239,17 @@ test("result returns the stored output for the latest finished job by default", 
     result.stdout,
     "Reviewed uncommitted changes.\nNo material issues found.\n\nCodex session ID: thr_review_finished\nResume in Codex: codex resume thr_review_finished\n"
   );
+
+  const implicit = run("node", [SCRIPT, "result"], {
+    cwd: workspace
+  });
+
+  assert.equal(implicit.status, 1);
+  assert.match(implicit.stderr, /An explicit job id is required\./);
+  assert.doesNotMatch(implicit.stdout, /No material issues found/);
 });
 
-test("result without a job id prefers the latest finished job from the current Claude session", () => {
+test("result without a job id lists the session-visible jobs instead of resolving one", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
@@ -3199,11 +3310,11 @@ test("result without a job id prefers the latest finished job from the current C
     }
   });
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(
-    result.stdout,
-    "Current session output.\n\nCodex session ID: thr_current\nResume in Codex: codex resume thr_current\n"
-  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /An explicit job id is required\./);
+  assert.match(result.stderr, /Visible jobs: review-current \(completed\)\./);
+  assert.doesNotMatch(result.stderr, /review-other/);
+  assert.equal(result.stdout, "");
 });
 
 test("result for a finished write-capable task returns the raw Codex final response", () => {
@@ -3221,7 +3332,8 @@ test("result for a finished write-capable task returns the raw Codex final respo
   });
   assert.equal(taskRun.status, 0, taskRun.stderr);
 
-  const result = run("node", [SCRIPT, "result"], {
+  const [taskJob] = loadState(repo).jobs;
+  const result = run("node", [SCRIPT, "result", taskJob.id], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -3316,7 +3428,7 @@ test("cancel refuses a running process that is not an owned worker", async (t) =
   assert.doesNotMatch(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
 });
 
-test("cancel without a job id ignores active jobs from other Claude sessions", () => {
+test("cancel without a job id fails closed instead of picking an active job", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
@@ -3365,13 +3477,14 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
     env
   });
   assert.equal(cancel.status, 1);
-  assert.match(cancel.stderr, /No active Codex jobs to cancel for this session\./);
+  assert.match(cancel.stderr, /An explicit job id is required\./);
+  assert.match(cancel.stderr, /No job is visible for this Claude session\./);
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.equal(state.jobs[0].status, "queued");
 });
 
-test("cancel with a job id hides another session job", () => {
+test("cancel with a job id reaches another session job", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
@@ -3413,13 +3526,14 @@ test("cancel with a job id hides another session job", () => {
     env
   });
   assert.equal(cancel.status, 1);
-  assert.match(cancel.stderr, /No job found/i);
+  assert.match(cancel.stderr, /not an owned background worker/i);
+  assert.doesNotMatch(cancel.stderr, /No job found/i);
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.equal(state.jobs[0].status, "queued");
 });
 
-test("cancel with an explicit id cannot stop another session's owned worker", async (t) => {
+test("cancel with an explicit id stops another session's owned worker", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "interruptible-slow-task");
@@ -3447,26 +3561,27 @@ test("cancel with an explicit id cannot stop another session's owned worker", as
     }
   });
 
-  const currentSessionEnv = {
+  const restartedSessionEnv = {
     ...buildEnv(binDir),
-    CODEX_COMPANION_SESSION_ID: "sess-current"
+    CODEX_COMPANION_SESSION_ID: "sess-restarted"
   };
-  const denied = run(
-    "node",
-    [SCRIPT, "cancel", jobId, "--json"],
-    { cwd: repo, env: currentSessionEnv }
-  );
-
-  assert.equal(denied.status, 1);
-  assert.match(denied.stderr, /No job found/i);
-  assert.equal(loadState(repo).jobs.find((job) => job.id === jobId).status, "running");
-
   const cancelled = run(
     "node",
     [SCRIPT, "cancel", jobId, "--json"],
-    { cwd: repo, env: otherSessionEnv }
+    { cwd: repo, env: restartedSessionEnv }
   );
+
   assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+  assert.equal(loadState(repo).jobs.find((job) => job.id === jobId).status, "cancelled");
+  await waitFor(() => {
+    try {
+      process.kill(running.worker.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
 });
 
 test("background task owns a direct app-server and cancellation stops its process tree", async (t) => {
