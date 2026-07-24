@@ -3954,6 +3954,13 @@ test("session end drains resistant workers within its bounded shutdown window wi
 
   assert.equal(result.timedOut, false);
   assert.equal(result.status, 0, result.stderr);
+  // Sabotaging the drain itself is covered by "session end fully cleans up jobs for the
+  // ending session" and "cancellation keeps the task worker anchor until a TERM-resistant
+  // app-server is killed"; this asserts the effect SessionEnd owns deterministically.
+  assert.equal(
+    loadState(repo).endedSessions.some((entry) => entry.sessionId === "sess-many"),
+    true
+  );
 
   const remaining = loadState(repo).jobs.filter(
     (job) => job.sessionId === "sess-many"

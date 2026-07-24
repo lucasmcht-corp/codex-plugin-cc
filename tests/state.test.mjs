@@ -540,6 +540,7 @@ test("session-start reconciliation obeys its transaction deadline under a held l
   await waitFor(() => fs.existsSync(enteredFile));
   let ownerResult;
   try {
+    const startedAt = Date.now();
     await assert.rejects(
       prepareSessionStart(workspace, {
         inspectOwnedWorkerImpl: () => ({ status: "gone" }),
@@ -552,6 +553,13 @@ test("session-start reconciliation obeys its transaction deadline under a held l
         }
       }),
       /timed out waiting for state lock/i
+    );
+    const elapsedMs = Date.now() - startedAt;
+    // The same message comes back on the 5000 ms default, so only the elapsed time
+    // proves the 75 ms recovery budget reached the state transaction.
+    assert.ok(
+      elapsedMs < 3000,
+      `session-start reconciliation waited ${elapsedMs} ms, so it ignored its recovery budget`
     );
   } finally {
     fs.writeFileSync(releaseFile, "release");
