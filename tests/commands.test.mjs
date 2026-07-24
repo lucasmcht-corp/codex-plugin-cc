@@ -4,6 +4,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
+import {
+  DEFAULT_APP_SERVER_CLOSE_CONFIG,
+  EXTERNAL_AGENT_IMPORT_TIMEOUT_MS,
+  STOP_REVIEW_FINALIZE_TIMEOUT_MS,
+  STOP_REVIEW_LAUNCH_TIMEOUT_MS,
+  STOP_REVIEW_STATUS_TIMEOUT_MS
+} from "../plugins/codex/scripts/lib/runtime-config.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 
@@ -20,10 +28,17 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /return Codex's output verbatim to the user/i);
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
-  assert.match(source, /review "\$ARGUMENTS"/);
+  assert.match(source, /review --arguments-base64 CANONICAL_BASE64_OF_EXACT_RAW_ARGUMENTS/);
+  assert.match(source, /codex-companion\.mjs" review\n/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
   assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review "\$ARGUMENTS"`/);
+  assert.match(source, /review --background --arguments-base64 CANONICAL_BASE64_OF_EXACT_RAW_ARGUMENTS/);
+  assert.doesNotMatch(source, /--arguments-base64 [A-Za-z0-9+/]{8,}={0,2}(?:\s|`|$)/);
+  assert.doesNotMatch(source, /command:.*\$ARGUMENTS/);
+  assert.doesNotMatch(source, /\bWrite\b|arguments-file|current-directory file/);
+  assert.match(source, /UserPromptExpansion review hook receives the original raw UTF-8 arguments/i);
+  assert.match(source, /Never compute, rewrite, or guess the base64 value yourself/i);
+  assert.match(source, /Deterministic review transport/);
   assert.match(source, /description:\s*"Codex review"/);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
@@ -32,8 +47,7 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /Treat untracked files or directories as reviewable work/i);
   assert.match(source, /Recommend waiting only when the review is clearly tiny, roughly 1-2 files total/i);
   assert.match(source, /In every other case, including unclear size, recommend background/i);
-  assert.match(source, /The companion script parses `--wait` and `--background`/i);
-  assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(source, /`--background` to create the owned detached worker/i);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
   assert.match(source, /does not support staged-only review, unstaged-only review, or extra focus text/i);
@@ -48,10 +62,17 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /return Codex's output verbatim to the user/i);
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
-  assert.match(source, /adversarial-review "\$ARGUMENTS"/);
+  assert.match(source, /adversarial-review --arguments-base64 CANONICAL_BASE64_OF_EXACT_RAW_ARGUMENTS/);
+  assert.match(source, /codex-companion\.mjs" adversarial-review\n/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\] \[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
+  assert.match(source, /adversarial-review --background --arguments-base64 CANONICAL_BASE64_OF_EXACT_RAW_ARGUMENTS/);
+  assert.doesNotMatch(source, /--arguments-base64 [A-Za-z0-9+/]{8,}={0,2}(?:\s|`|$)/);
+  assert.doesNotMatch(source, /command:.*\$ARGUMENTS/);
+  assert.doesNotMatch(source, /\bWrite\b|arguments-file|current-directory file/);
+  assert.match(source, /UserPromptExpansion review hook receives the original raw UTF-8 arguments/i);
+  assert.match(source, /Never compute, rewrite, or guess the base64 value yourself/i);
+  assert.match(source, /Deterministic review transport/);
   assert.match(source, /description:\s*"Codex adversarial review"/);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
@@ -60,8 +81,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /Treat untracked files or directories as reviewable work/i);
   assert.match(source, /Recommend waiting only when the scoped review is clearly tiny, roughly 1-2 files total/i);
   assert.match(source, /In every other case, including unclear size, recommend background/i);
-  assert.match(source, /The companion script parses `--wait` and `--background`/i);
-  assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(source, /`--background` to create the owned detached worker/i);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
   assert.match(source, /uses the same review target selection as `\/codex:review`/i);
@@ -78,6 +98,7 @@ test("continue is not exposed as a user-facing command", () => {
     "rescue.md",
     "result.md",
     "review.md",
+    "send.md",
     "setup.md",
     "status.md",
     "transfer.md"
@@ -95,7 +116,7 @@ test("rescue command absorbs continue semantics", () => {
   // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
   // because rescue.md named the routing with ambiguous prose ("Route this
   // request to the `codex:codex-rescue` subagent") while running under
-  // `context: fork` — forked general-purpose subagents do not expose the
+  // `context: fork`: forked general-purpose subagents do not expose the
   // `Agent` tool, so the fork fell back to `Skill` and re-entered this
   // command. Pin the explicit transport and the inline (no-fork) execution.
   assert.match(rescue, /subagent_type: "codex:codex-rescue"/);
@@ -111,7 +132,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /Start a new Codex thread/);
   assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
-  assert.match(rescue, /Do not forward them to `task`/i);
+  assert.match(rescue, /`--background` selects an owned detached worker and must be forwarded to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
@@ -129,6 +150,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /thin forwarding wrapper/i);
   assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
   assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
+  assert.match(agent, /pass `--background` to `task` so the companion creates an owned detached worker/i);
   assert.match(agent, /Use exactly one `Bash` call/i);
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
@@ -148,8 +170,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
-  assert.match(runtimeSkill, /Strip it before calling `task`/i);
+  assert.match(runtimeSkill, /includes `--background`, pass it to `task`/i);
+  assert.match(runtimeSkill, /Strip `--wait` before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
@@ -167,22 +189,34 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:transfer`/);
   assert.match(readme, /### `\/codex:status`/);
   assert.match(readme, /### `\/codex:result`/);
+  assert.match(readme, /### `\/codex:send`/);
   assert.match(readme, /### `\/codex:cancel`/);
 });
 
-test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
+test("transfer, result, send, and cancel commands are exposed as deterministic runtime entrypoints", () => {
   const transfer = read("commands/transfer.md");
+  const status = read("commands/status.md");
   const result = read("commands/result.md");
+  const send = read("commands/send.md");
   const cancel = read("commands/cancel.md");
   const resultHandling = read("skills/codex-result-handling/SKILL.md");
 
   assert.match(transfer, /disable-model-invocation:\s*true/);
-  assert.match(transfer, /codex-companion\.mjs" transfer "\$ARGUMENTS"/);
-  assert.match(transfer, /codex resume <session-id>/);
+  assert.match(transfer, /Codex command hook owns this command/i);
+  assert.doesNotMatch(transfer, /\$ARGUMENTS|!\s*`/);
+  assert.match(status, /disable-model-invocation:\s*true/);
+  assert.match(status, /Codex command hook owns this command/i);
+  assert.doesNotMatch(status, /\$ARGUMENTS|!\s*`/);
   assert.match(result, /disable-model-invocation:\s*true/);
-  assert.match(result, /codex-companion\.mjs" result "\$ARGUMENTS"/);
+  assert.match(result, /Codex command hook owns this command/i);
+  assert.doesNotMatch(result, /\$ARGUMENTS|!\s*`/);
+  assert.match(send, /disable-model-invocation:\s*true/);
+  assert.match(send, /Codex send hook owns this command/i);
+  assert.match(send, /<job-id> <instruction>/);
+  assert.doesNotMatch(send, /!\s*`|\$ARGUMENTS|\$job|\$instruction/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
-  assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
+  assert.match(cancel, /Codex command hook owns this command/i);
+  assert.doesNotMatch(cancel, /\$ARGUMENTS|!\s*`/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
 });
@@ -204,10 +238,44 @@ test("internal docs use task terminology for rescue runs", () => {
 
 test("hooks keep session-end cleanup and stop gating enabled", () => {
   const source = read("hooks/hooks.json");
+  const hooks = JSON.parse(source);
+  const promptHooks = hooks.hooks.UserPromptExpansion;
+  const timeoutByMatcher = new Map(
+    promptHooks.map((entry) => [entry.matcher, entry.hooks[0].timeout])
+  );
+  const stopTimeoutMs = hooks.hooks.Stop[0].hooks[0].timeout * 1000;
+  const transferTimeoutMs =
+    timeoutByMatcher.get("^(codex:)?transfer$") * 1000;
+  const appServerCloseMs = Object.values(DEFAULT_APP_SERVER_CLOSE_CONFIG)
+    .reduce((total, timeout) => total + timeout, 0);
   assert.match(source, /SessionStart/);
   assert.match(source, /SessionEnd/);
+  assert.match(source, /UserPromptExpansion/);
+  assert.match(source, /\^\(codex:\)\?send\$/);
+  assert.match(source, /\^\(codex:\)\?\(review\|adversarial-review\)\$/);
+  assert.equal(timeoutByMatcher.get("^(codex:)?transfer$"), 150);
+  assert.equal(timeoutByMatcher.get("^(codex:)?status$"), 900);
+  assert.equal(
+    timeoutByMatcher.get("^(codex:)?(result|cancel|setup)$"),
+    30
+  );
+  assert.match(source, /"command": "node"/);
+  assert.match(source, /"send-hook"/);
+  assert.match(source, /"review-hook"/);
+  assert.match(source, /"command-hook"/);
+  assert.doesNotMatch(source, /node \\"/);
   assert.match(source, /stop-review-gate-hook\.mjs/);
   assert.match(source, /session-lifecycle-hook\.mjs/);
+  assert.ok(
+    transferTimeoutMs > EXTERNAL_AGENT_IMPORT_TIMEOUT_MS + appServerCloseMs
+  );
+  assert.ok(
+    stopTimeoutMs >
+      STOP_REVIEW_LAUNCH_TIMEOUT_MS +
+        STOP_REVIEW_STATUS_TIMEOUT_MS +
+        STOP_REVIEW_FINALIZE_TIMEOUT_MS +
+        appServerCloseMs
+  );
 });
 
 test("setup command can offer Codex install and still points users to codex login", () => {
@@ -217,9 +285,35 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
-  assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
+  assert.match(setup, /--arguments-base64 CANONICAL_BASE64_OF_EXACT_RAW_ARGUMENTS/);
+  assert.match(setup, /Never put raw\s+arguments in a shell command/i);
+  assert.doesNotMatch(setup, /\$ARGUMENTS/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
+});
+
+test("machine-readable metadata identifies the reliability fork", () => {
+  const marketplace = JSON.parse(
+    fs.readFileSync(path.join(ROOT, ".claude-plugin", "marketplace.json"), "utf8")
+  );
+  const plugin = JSON.parse(
+    fs.readFileSync(
+      path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json"),
+      "utf8"
+    )
+  );
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.join(ROOT, "package.json"), "utf8")
+  );
+
+  assert.equal(marketplace.name, "lucasmcht-codex-reliability");
+  assert.equal(marketplace.owner.name, "Lucas Michalet");
+  assert.equal(marketplace.plugins[0].name, "codex");
+  assert.match(marketplace.plugins[0].description, /reliability fork/i);
+  assert.equal(plugin.name, "codex");
+  assert.equal(plugin.author.name, "Lucas Michalet");
+  assert.match(plugin.description, /reliability fork/i);
+  assert.equal(packageJson.name, "@lucasmcht/codex-plugin-cc");
 });

@@ -2,15 +2,29 @@ name: Pull Request CI
 
 on:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   ci:
-    name: CI
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: CI (${{ matrix.os }}, Codex ${{ matrix.codex-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    continue-on-error: ${{ matrix.optional || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            codex-version: 0.145.0
+          - os: ubuntu-latest
+            codex-version: latest
+          # Reports without blocking until the Windows hardening lands: vault task 2026-07-24-durcissement-windows-codex-plugin-cc.
+          - os: windows-latest
+            codex-version: latest
+            optional: true
 
     steps:
       - name: Check out repository
@@ -26,10 +40,13 @@ jobs:
         run: npm ci
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex
+        run: npm install -g @openai/codex@${{ matrix.codex-version }}
 
+      # Budgeted on the step so an overrun fails the job instead of cancelling it: a cancelled job
+      # ignores continue-on-error and would still block the pull request.
       - name: Run test suite
         run: npm test
+        timeout-minutes: 10
 
       - name: Run build
         run: npm run build

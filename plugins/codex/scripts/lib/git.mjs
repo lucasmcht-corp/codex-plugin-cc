@@ -5,22 +5,90 @@ import { isProbablyText } from "./fs.mjs";
 import { formatCommandFailure, runCommand, runCommandChecked } from "./process.mjs";
 
 const MAX_UNTRACKED_BYTES = 24 * 1024;
+const MAX_UNTRACKED_CONTEXT_BYTES = 96 * 1024;
+const MAX_UNTRACKED_CONTEXT_FILES = 20;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 
+/**
+ * @typedef {{
+ *   cwd?: string,
+ *   env?: NodeJS.ProcessEnv,
+ *   input?: string,
+ *   maxBuffer?: number,
+ *   stdio?: import("node:child_process").StdioOptions,
+ *   shell?: boolean | string
+ * }} GitCommandOptions
+ *
+ * @typedef {{
+ *   command: string,
+ *   args: string[],
+ *   status: number | null,
+ *   signal: NodeJS.Signals | null,
+ *   stdout: string,
+ *   stderr: string,
+ *   error: Error | null
+ * }} GitCommandResult
+ *
+ * @typedef {{
+ *   staged: string[],
+ *   unstaged: string[],
+ *   untracked: string[],
+ *   isDirty: boolean
+ * }} WorkingTreeState
+ *
+ * @typedef {{
+ *   mode: "working-tree",
+ *   label: string,
+ *   explicit: boolean
+ * } | {
+ *   mode: "branch",
+ *   label: string,
+ *   baseRef: string,
+ *   explicit: boolean
+ * }} ResolvedReviewTarget
+ *
+ * @typedef {{
+ *   mergeBase: string,
+ *   commitRange: string,
+ *   reviewRange: string
+ * }} BranchComparison
+ *
+ * @typedef {{
+ *   includeDiff?: boolean,
+ *   comparison?: BranchComparison,
+ *   maxInlineFiles?: number,
+ *   maxInlineDiffBytes?: number
+ * }} ReviewCollectionOptions
+ */
+
 // Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
+/**
+ * @param {string} cwd
+ * @param {string[]} args
+ * @param {GitCommandOptions} [options]
+ * @returns {GitCommandResult}
+ */
 function git(cwd, args, options = {}) {
   return runCommand("git", args, { cwd, ...options, shell: false });
 }
 
+/**
+ * @param {string} cwd
+ * @param {string[]} args
+ * @param {GitCommandOptions} [options]
+ * @returns {GitCommandResult}
+ */
 function gitChecked(cwd, args, options = {}) {
   return runCommandChecked("git", args, { cwd, ...options, shell: false });
 }
 
+/** @param {...string[]} groups */
 function listUniqueFiles(...groups) {
   return [...new Set(groups.flat().filter(Boolean))].sort();
 }
 
+/** @param {unknown} value */
 function normalizeMaxInlineFiles(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
@@ -29,6 +97,7 @@ function normalizeMaxInlineFiles(value) {
   return Math.floor(parsed);
 }
 
+/** @param {unknown} value */
 function normalizeMaxInlineDiffBytes(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
@@ -37,9 +106,22 @@ function normalizeMaxInlineDiffBytes(value) {
   return Math.floor(parsed);
 }
 
+/**
+ * @param {unknown} error
+ * @returns {error is Error & { code: string }}
+ */
+function isErrnoException(error) {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    typeof error.code === "string"
+  );
+}
+
+/** @param {string} cwd @param {string[]} args @param {number} maxBytes */
 function measureGitOutputBytes(cwd, args, maxBytes) {
   const result = git(cwd, args, { maxBuffer: maxBytes + 1 });
-  if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOBUFS") {
+  if (isErrnoException(result.error) && result.error.code === "ENOBUFS") {
     return maxBytes + 1;
   }
   if (result.error) {
@@ -51,6 +133,7 @@ function measureGitOutputBytes(cwd, args, maxBytes) {
   return Buffer.byteLength(result.stdout, "utf8");
 }
 
+/** @param {string} cwd @param {string[][]} argSets @param {number} maxBytes */
 function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
   let totalBytes = 0;
   for (const args of argSets) {
@@ -66,6 +149,7 @@ function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
   return totalBytes;
 }
 
+/** @param {string} cwd @param {string} baseRef @returns {BranchComparison} */
 function buildBranchComparison(cwd, baseRef) {
   const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseRef]).stdout.trim();
   return {
@@ -75,6 +159,7 @@ function buildBranchComparison(cwd, baseRef) {
   };
 }
 
+/** @param {string} cwd */
 export function ensureGitRepository(cwd) {
   const result = git(cwd, ["rev-parse", "--show-toplevel"]);
   const errorCode = result.error && "code" in result.error ? result.error.code : null;
@@ -87,10 +172,12 @@ export function ensureGitRepository(cwd) {
   return result.stdout.trim();
 }
 
+/** @param {string} cwd */
 export function getRepoRoot(cwd) {
   return gitChecked(cwd, ["rev-parse", "--show-toplevel"]).stdout.trim();
 }
 
+/** @param {string} cwd */
 export function detectDefaultBranch(cwd) {
   const symbolic = git(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
   if (symbolic.status === 0) {
@@ -115,10 +202,12 @@ export function detectDefaultBranch(cwd) {
   throw new Error("Unable to detect the repository default branch. Pass --base <ref> or use --scope working-tree.");
 }
 
+/** @param {string} cwd */
 export function getCurrentBranch(cwd) {
   return gitChecked(cwd, ["branch", "--show-current"]).stdout.trim() || "HEAD";
 }
 
+/** @param {string} cwd @returns {WorkingTreeState} */
 export function getWorkingTreeState(cwd) {
   const staged = gitChecked(cwd, ["diff", "--cached", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
   const unstaged = gitChecked(cwd, ["diff", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
@@ -132,6 +221,11 @@ export function getWorkingTreeState(cwd) {
   };
 }
 
+/**
+ * @param {string} cwd
+ * @param {{ scope?: "auto" | "working-tree" | "branch", base?: string }} [options]
+ * @returns {ResolvedReviewTarget}
+ */
 export function resolveReviewTarget(cwd, options = {}) {
   ensureGitRepository(cwd);
 
@@ -190,38 +284,144 @@ export function resolveReviewTarget(cwd, options = {}) {
   };
 }
 
+/** @param {string} title @param {string} body */
 function formatSection(title, body) {
   return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
 }
 
-function formatUntrackedFile(cwd, relativePath) {
-  const absolutePath = path.join(cwd, relativePath);
-  let stat;
-  try {
-    stat = fs.statSync(absolutePath);
-  } catch {
-    return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
-  }
-  if (stat.isDirectory()) {
-    return `### ${relativePath}\n(skipped: directory)`;
-  }
-  if (stat.size > MAX_UNTRACKED_BYTES) {
-    return `### ${relativePath}\n(skipped: ${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit)`;
-  }
-
-  let buffer;
-  try {
-    buffer = fs.readFileSync(absolutePath);
-  } catch {
-    return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
-  }
-  if (!isProbablyText(buffer)) {
-    return `### ${relativePath}\n(skipped: binary file)`;
-  }
-
-  return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
+/** @param {string} content */
+function buildUntrackedFileContext(content) {
+  return {
+    content,
+    bytes: Buffer.byteLength(content, "utf8")
+  };
 }
 
+/** @param {string} cwd @param {string} relativePath @returns {{ content: string, bytes: number }} */
+function formatUntrackedFile(cwd, relativePath) {
+  const absolutePath = path.join(cwd, relativePath);
+  let entry;
+  try {
+    entry = fs.lstatSync(absolutePath);
+  } catch {
+    return buildUntrackedFileContext(
+      `### ${relativePath}\n(skipped: unreadable file)`
+    );
+  }
+  if (entry.isSymbolicLink()) {
+    return buildUntrackedFileContext(
+      `### ${relativePath}\n(skipped: symbolic link)`
+    );
+  }
+  if (entry.isDirectory()) {
+    return buildUntrackedFileContext(
+      `### ${relativePath}\n(skipped: directory)`
+    );
+  }
+  if (!entry.isFile()) {
+    return buildUntrackedFileContext(
+      `### ${relativePath}\n(skipped: not a regular file)`
+    );
+  }
+
+  let descriptor;
+  try {
+    descriptor = fs.openSync(
+      absolutePath,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+    );
+    const opened = fs.fstatSync(descriptor);
+    if (
+      !opened.isFile() ||
+      opened.dev !== entry.dev ||
+      opened.ino !== entry.ino
+    ) {
+      return buildUntrackedFileContext(
+        `### ${relativePath}\n(skipped: file changed during inspection)`
+      );
+    }
+    if (opened.size > MAX_UNTRACKED_BYTES) {
+      return buildUntrackedFileContext(
+        `### ${relativePath}\n(skipped: ${opened.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit)`
+      );
+    }
+    const buffer = fs.readFileSync(descriptor);
+    if (!isProbablyText(buffer)) {
+      return buildUntrackedFileContext(
+        `### ${relativePath}\n(skipped: binary file)`
+      );
+    }
+    return buildUntrackedFileContext(
+      [
+        `### ${relativePath}`,
+        "```",
+        buffer.toString("utf8").trimEnd(),
+        "```"
+      ].join("\n")
+    );
+  } catch {
+    return buildUntrackedFileContext(
+      `### ${relativePath}\n(skipped: unreadable file)`
+    );
+  } finally {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
+/** @param {string} cwd @param {string[]} files */
+function collectUntrackedFiles(cwd, files) {
+  const selected = [];
+  let selectedBytes = 0;
+  let omitted = 0;
+  for (const file of [...new Set(files)].sort()) {
+    if (selected.length >= MAX_UNTRACKED_CONTEXT_FILES) {
+      omitted += 1;
+      continue;
+    }
+    const formatted = formatUntrackedFile(cwd, file);
+    const separatorBytes = selected.length > 0 ? 2 : 0;
+    if (
+      selectedBytes + separatorBytes + formatted.bytes >
+      MAX_UNTRACKED_CONTEXT_BYTES
+    ) {
+      omitted += 1;
+      continue;
+    }
+    selected.push(formatted);
+    selectedBytes += separatorBytes + formatted.bytes;
+  }
+  if (omitted > 0) {
+    let omissionContext = buildUntrackedFileContext(
+      `(omitted: ${omitted} additional untracked file(s) due to cumulative limits of ${MAX_UNTRACKED_CONTEXT_FILES} files and ${MAX_UNTRACKED_CONTEXT_BYTES} bytes)`
+    );
+    while (
+      selectedBytes +
+        (selected.length > 0 ? 2 : 0) +
+        omissionContext.bytes >
+      MAX_UNTRACKED_CONTEXT_BYTES
+    ) {
+      const removed = selected.pop();
+      if (removed === undefined) {
+        break;
+      }
+      selectedBytes -= removed.bytes + (selected.length > 0 ? 2 : 0);
+      omitted += 1;
+      omissionContext = buildUntrackedFileContext(
+        `(omitted: ${omitted} additional untracked file(s) due to cumulative limits of ${MAX_UNTRACKED_CONTEXT_FILES} files and ${MAX_UNTRACKED_CONTEXT_BYTES} bytes)`
+      );
+    }
+    selected.push(omissionContext);
+  }
+  return selected.map((entry) => entry.content).join("\n\n");
+}
+
+/**
+ * @param {string} cwd
+ * @param {WorkingTreeState} state
+ * @param {{ includeDiff?: boolean }} [options]
+ */
 function collectWorkingTreeContext(cwd, state, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trim();
@@ -231,7 +431,7 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   if (includeDiff) {
     const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
     const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untrackedBody = collectUntrackedFiles(cwd, state.untracked);
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff", stagedDiff),
@@ -241,7 +441,7 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   } else {
     const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
     const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untrackedBody = collectUntrackedFiles(cwd, state.untracked);
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff Stat", stagedStat),
@@ -259,6 +459,11 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   };
 }
 
+/**
+ * @param {string} cwd
+ * @param {string} baseRef
+ * @param {{ includeDiff?: boolean, comparison?: BranchComparison }} [options]
+ */
 function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
@@ -289,6 +494,7 @@ function collectBranchContext(cwd, baseRef, options = {}) {
   };
 }
 
+/** @param {{ includeDiff?: boolean }} [options] */
 function buildAdversarialCollectionGuidance(options = {}) {
   if (options.includeDiff !== false) {
     return "Use the repository context below as primary evidence.";
@@ -297,6 +503,11 @@ function buildAdversarialCollectionGuidance(options = {}) {
   return "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
 }
 
+/**
+ * @param {string} cwd
+ * @param {ResolvedReviewTarget} target
+ * @param {ReviewCollectionOptions} [options]
+ */
 export function collectReviewContext(cwd, target, options = {}) {
   const repoRoot = getRepoRoot(cwd);
   const currentBranch = getCurrentBranch(repoRoot);

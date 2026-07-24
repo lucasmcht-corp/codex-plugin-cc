@@ -1,3 +1,68 @@
+import { isActiveJobStatus } from "./job-lifecycle.mjs";
+
+/**
+ * @typedef {Record<string, unknown>} UnknownRecord
+ *
+ * @typedef {{
+ *   verdict: string,
+ *   summary: string,
+ *   findings: unknown[],
+ *   next_steps: unknown[]
+ * }} ValidReviewResultData
+ *
+ * @typedef {{
+ *   severity: string,
+ *   title: string,
+ *   body: string,
+ *   file: string,
+ *   line_start: number | null,
+ *   line_end: number | null,
+ *   recommendation: string
+ * }} ReviewFinding
+ *
+ * @typedef {{
+ *   id: string,
+ *   status: string,
+ *   kindLabel?: string,
+ *   title?: string,
+ *   jobClass?: string,
+ *   phase?: string | null,
+ *   elapsed?: string | null,
+ *   duration?: string | null,
+ *   threadId?: string | null,
+ *   turnId?: string | null,
+ *   steering?: object | null,
+ *   worker?: { token?: string } | null,
+ *   summary?: string | null,
+ *   logFile?: string | null,
+ *   write?: boolean,
+ *   progressPreview?: string[],
+ *   errorMessage?: string | null,
+ *   rendered?: string | null,
+ *   result?: unknown
+ * }} RenderableJob
+ *
+ * @typedef {{
+ *   parsed?: unknown,
+ *   parseError?: string | null,
+ *   rawOutput?: string | null,
+ *   failureMessage?: string | null,
+ *   reasoningSummary?: string[]
+ * }} ParsedResult
+ *
+ * @typedef {{
+ *   reviewLabel: string,
+ *   targetLabel: string,
+ *   reasoningSummary?: string[]
+ * }} ReviewMeta
+ */
+
+/** @param {unknown} value @returns {value is UnknownRecord} */
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** @param {string} severity */
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -11,6 +76,7 @@ function severityRank(severity) {
   }
 }
 
+/** @param {ReviewFinding} finding */
 function formatLineRange(finding) {
   if (!finding.line_start) {
     return "";
@@ -21,8 +87,9 @@ function formatLineRange(finding) {
   return `:${finding.line_start}-${finding.line_end}`;
 }
 
+/** @param {unknown} data */
 function validateReviewResultShape(data) {
-  if (!data || typeof data !== "object" || Array.isArray(data)) {
+  if (!isRecord(data)) {
     return "Expected a top-level JSON object.";
   }
   if (typeof data.verdict !== "string" || !data.verdict.trim()) {
@@ -40,11 +107,25 @@ function validateReviewResultShape(data) {
   return null;
 }
 
+/** @param {unknown} data @returns {data is ValidReviewResultData} */
+function isValidReviewResultData(data) {
+  return validateReviewResultShape(data) === null;
+}
+
+/** @param {unknown} finding @param {number} index @returns {ReviewFinding} */
 function normalizeReviewFinding(finding, index) {
-  const source = finding && typeof finding === "object" && !Array.isArray(finding) ? finding : {};
-  const lineStart = Number.isInteger(source.line_start) && source.line_start > 0 ? source.line_start : null;
+  const source = isRecord(finding) ? finding : {};
+  const lineStart =
+    typeof source.line_start === "number" &&
+    Number.isInteger(source.line_start) &&
+    source.line_start > 0
+      ? source.line_start
+      : null;
   const lineEnd =
-    Number.isInteger(source.line_end) && source.line_end > 0 && (!lineStart || source.line_end >= lineStart)
+    typeof source.line_end === "number" &&
+    Number.isInteger(source.line_end) &&
+    source.line_end > 0 &&
+    (!lineStart || source.line_end >= lineStart)
       ? source.line_end
       : lineStart;
 
@@ -59,17 +140,19 @@ function normalizeReviewFinding(finding, index) {
   };
 }
 
+/** @param {ValidReviewResultData} data */
 function normalizeReviewResultData(data) {
   return {
     verdict: data.verdict.trim(),
     summary: data.summary.trim(),
     findings: data.findings.map((finding, index) => normalizeReviewFinding(finding, index)),
-    next_steps: data.next_steps
-      .filter((step) => typeof step === "string" && step.trim())
-      .map((step) => step.trim())
+    next_steps: data.next_steps.flatMap((step) =>
+      typeof step === "string" && step.trim() ? [step.trim()] : []
+    )
   };
 }
 
+/** @param {RenderableJob | null | undefined} storedJob */
 function isStructuredReviewStoredResult(storedJob) {
   const result = storedJob?.result;
   if (!result || typeof result !== "object" || Array.isArray(result)) {
@@ -81,6 +164,26 @@ function isStructuredReviewStoredResult(storedJob) {
   );
 }
 
+/** @param {RenderableJob | null | undefined} storedJob */
+function readStoredRawOutput(storedJob) {
+  const result = storedJob?.result;
+  if (!isRecord(result)) {
+    return "";
+  }
+  if (typeof result.rawOutput === "string" && result.rawOutput) {
+    return result.rawOutput;
+  }
+  if (
+    isRecord(result.codex) &&
+    typeof result.codex.stdout === "string" &&
+    result.codex.stdout
+  ) {
+    return result.codex.stdout;
+  }
+  return "";
+}
+
+/** @param {RenderableJob} job */
 function formatJobLine(job) {
   const parts = [job.id, `${job.status || "unknown"}`];
   if (job.kindLabel) {
@@ -92,6 +195,7 @@ function formatJobLine(job) {
   return parts.join(" | ");
 }
 
+/** @param {unknown} value */
 function escapeMarkdownCell(value) {
   return String(value ?? "")
     .replace(/\|/g, "\\|")
@@ -99,6 +203,7 @@ function escapeMarkdownCell(value) {
     .trim();
 }
 
+/** @param {RenderableJob | null | undefined} job */
 function formatCodexResumeCommand(job) {
   if (!job?.threadId) {
     return null;
@@ -106,13 +211,28 @@ function formatCodexResumeCommand(job) {
   return `codex resume ${job.threadId}`;
 }
 
+/** @param {RenderableJob} job */
+function isActiveJob(job) {
+  return isActiveJobStatus(job.status);
+}
+
+/** @param {string[]} lines @param {RenderableJob[]} jobs */
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
   lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/codex:status ${job.id}`];
-    if (job.status === "queued" || job.status === "running") {
+    if (
+      job.status === "running" &&
+      job.jobClass === "task" &&
+      job.threadId &&
+      job.turnId &&
+      job.steering
+    ) {
+      actions.push(`/codex:send ${job.id} "instruction"`);
+    }
+    if (isActiveJob(job) && job.worker?.token) {
       actions.push(`/codex:cancel ${job.id}`);
     }
     lines.push(
@@ -121,6 +241,18 @@ function appendActiveJobsTable(lines, jobs) {
   }
 }
 
+/**
+ * @param {string[]} lines
+ * @param {RenderableJob} job
+ * @param {{
+ *   showElapsed?: boolean,
+ *   showDuration?: boolean,
+ *   showLog?: boolean,
+ *   showCancelHint?: boolean,
+ *   showResultHint?: boolean,
+ *   showReviewHint?: boolean
+ * }} [options]
+ */
 function pushJobDetails(lines, job, options = {}) {
   lines.push(`- ${formatJobLine(job)}`);
   if (job.summary) {
@@ -145,13 +277,13 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
   }
-  if ((job.status === "queued" || job.status === "running") && options.showCancelHint) {
+  if (isActiveJob(job) && job.worker?.token && options.showCancelHint) {
     lines.push(`  Cancel: /codex:cancel ${job.id}`);
   }
-  if (job.status !== "queued" && job.status !== "running" && options.showResultHint) {
+  if (!isActiveJob(job) && options.showResultHint) {
     lines.push(`  Result: /codex:result ${job.id}`);
   }
-  if (job.status !== "queued" && job.status !== "running" && job.jobClass === "task" && job.write && options.showReviewHint) {
+  if (!isActiveJob(job) && job.jobClass === "task" && job.write && options.showReviewHint) {
     lines.push("  Review changes: /codex:review --wait");
     lines.push("  Stricter review: /codex:adversarial-review --wait");
   }
@@ -163,6 +295,7 @@ function pushJobDetails(lines, job, options = {}) {
   }
 }
 
+/** @param {string[]} lines @param {string[] | null | undefined} reasoningSummary */
 function appendReasoningSection(lines, reasoningSummary) {
   if (!Array.isArray(reasoningSummary) || reasoningSummary.length === 0) {
     return;
@@ -174,6 +307,20 @@ function appendReasoningSection(lines, reasoningSummary) {
   }
 }
 
+/**
+ * @param {{
+ *   ready: boolean,
+ *   node: { detail: string },
+ *   npm: { detail: string },
+ *   claude: { detail: string },
+ *   codex: { detail: string },
+ *   auth: { detail: string },
+ *   sessionRuntime: { label: string },
+ *   reviewGateEnabled: boolean,
+ *   actionsTaken: string[],
+ *   nextSteps: string[]
+ * }} report
+ */
 export function renderSetupReport(report) {
   const lines = [
     "# Codex Setup",
@@ -183,6 +330,7 @@ export function renderSetupReport(report) {
     "Checks:",
     `- node: ${report.node.detail}`,
     `- npm: ${report.npm.detail}`,
+    `- claude: ${report.claude.detail}`,
     `- codex: ${report.codex.detail}`,
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
@@ -208,6 +356,7 @@ export function renderSetupReport(report) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+/** @param {ParsedResult} parsedResult @param {ReviewMeta} meta */
 export function renderReviewResult(parsedResult, meta) {
   if (!parsedResult.parsed) {
     const lines = [
@@ -245,6 +394,9 @@ export function renderReviewResult(parsedResult, meta) {
     appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
 
     return `${lines.join("\n").trimEnd()}\n`;
+  }
+  if (!isValidReviewResultData(parsedResult.parsed)) {
+    throw new Error("Review result validation changed during rendering.");
   }
 
   const data = normalizeReviewResultData(parsedResult.parsed);
@@ -285,6 +437,10 @@ export function renderReviewResult(parsedResult, meta) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+/**
+ * @param {{ stdout: string, stderr: string, status: number | null }} result
+ * @param {ReviewMeta} meta
+ */
 export function renderNativeReviewResult(result, meta) {
   const stdout = result.stdout.trim();
   const stderr = result.stderr.trim();
@@ -312,7 +468,8 @@ export function renderNativeReviewResult(result, meta) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderTaskResult(parsedResult, meta) {
+/** @param {ParsedResult} parsedResult @param {object} _meta */
+export function renderTaskResult(parsedResult, _meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
   if (rawOutput) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
@@ -322,6 +479,16 @@ export function renderTaskResult(parsedResult, meta) {
   return `${message}\n`;
 }
 
+/**
+ * @param {{
+ *   sessionRuntime: { label: string },
+ *   config: { stopReviewGate?: boolean },
+ *   running: RenderableJob[],
+ *   latestFinished: RenderableJob | null,
+ *   recent: RenderableJob[],
+ *   needsReview: boolean
+ * }} report
+ */
 export function renderStatusReport(report) {
   const lines = [
     "# Codex Status",
@@ -374,11 +541,12 @@ export function renderStatusReport(report) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+/** @param {RenderableJob} job */
 export function renderJobStatusReport(job) {
   const lines = ["# Codex Job Status", ""];
   pushJobDetails(lines, job, {
-    showElapsed: job.status === "queued" || job.status === "running",
-    showDuration: job.status !== "queued" && job.status !== "running",
+    showElapsed: isActiveJob(job),
+    showDuration: !isActiveJob(job),
     showLog: true,
     showCancelHint: true,
     showResultHint: true,
@@ -387,6 +555,7 @@ export function renderJobStatusReport(job) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+/** @param {RenderableJob} job @param {RenderableJob | null | undefined} storedJob */
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
@@ -398,10 +567,7 @@ export function renderStoredJobResult(job, storedJob) {
     return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
   }
 
-  const rawOutput =
-    (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
-    (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
-    "";
+  const rawOutput = readStoredRawOutput(storedJob);
   if (rawOutput) {
     const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
     if (!threadId) {
@@ -445,6 +611,7 @@ export function renderStoredJobResult(job, storedJob) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+/** @param {RenderableJob} job */
 export function renderCancelReport(job) {
   const lines = [
     "# Codex Cancel",
@@ -462,4 +629,19 @@ export function renderCancelReport(job) {
   lines.push("- Check `/codex:status` for the updated queue.");
 
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/**
+ * @param {{ jobId: string, requestId: string, threadId: string, turnId: string }} payload
+ */
+export function renderSteeringReport(payload) {
+  return [
+    "# Codex Steering",
+    "",
+    `Accepted instruction for ${payload.jobId}.`,
+    `Request: ${payload.requestId}`,
+    `Thread: ${payload.threadId}`,
+    `Turn: ${payload.turnId}`,
+    ""
+  ].join("\n");
 }

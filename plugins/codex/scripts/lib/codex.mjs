@@ -1,12 +1,39 @@
 /**
  * @typedef {import("./app-server-protocol").AppServerNotification} AppServerNotification
+ * @typedef {import("./app-server-protocol").ExternalAgentConfigImportParams} ExternalAgentConfigImportParams
  * @typedef {import("./app-server-protocol").ReviewTarget} ReviewTarget
  * @typedef {import("./app-server-protocol").ThreadItem} ThreadItem
  * @typedef {import("./app-server-protocol").ThreadResumeParams} ThreadResumeParams
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
+ * @typedef {Awaited<ReturnType<typeof CodexAppServerClient.connect>>} AppServerClient
+ * @typedef {Record<string, unknown>} UnknownRecord
+ * @typedef {{ id: string, status: string }} CapturedTurn
+ * @typedef {{
+ *   turn: CapturedTurn,
+ *   reviewThreadId?: string
+ * }} TurnResponse
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
+ * @typedef {{
+ *   model?: string | null,
+ *   approvalPolicy?: ThreadStartParams["approvalPolicy"],
+ *   sandbox?: ThreadStartParams["sandbox"],
+ *   ephemeral?: boolean
+ * }} ThreadRuntimeOptions
+ * @typedef {{
+ *   message?: string,
+ *   phase?: string | null,
+ *   stderrMessage?: string | null,
+ *   logTitle?: string | null,
+ *   logBody?: string | null
+ * }} ProgressEvent
+ * @typedef {{
+ *   threadName?: string | null,
+ *   name?: string | null,
+ *   agentNickname?: string | null,
+ *   agentRole?: string | null
+ * }} ThreadLabelOptions
  * @typedef {{
  *   threadId: string,
  *   rootThreadId: string,
@@ -18,12 +45,14 @@
  *   completion: Promise<TurnCaptureState>,
  *   resolveCompletion: (state: TurnCaptureState) => void,
  *   rejectCompletion: (error: unknown) => void,
- *   finalTurn: Turn | null,
+ *   finalTurn: CapturedTurn | null,
  *   completed: boolean,
  *   finalAnswerSeen: boolean,
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
+ *   completionConfirmationActive: boolean,
+ *   confirmCompletion: (() => Promise<void>) | null,
  *   lastAgentMessage: string,
  *   reviewText: string,
  *   reasoningSummary: string[],
@@ -33,6 +62,56 @@
  *   commandExecutions: ThreadItem[],
  *   onProgress: ProgressReporter | null
  * }} TurnCaptureState
+ *
+ * @typedef {{
+ *   onProgress?: ProgressReporter | null,
+ *   onResponse?: (response: TurnResponse, state: TurnCaptureState) => void,
+ *   onActiveTurn?: (activeTurn: {
+ *     threadId: string,
+ *     turnId: string,
+ *     steer: (request: { requestId: string, instruction: string }) => Promise<{ threadId: string, turnId: string }>
+ *   }) => Promise<(() => Promise<void> | void) | null | undefined>
+ * }} CaptureTurnOptions
+ * @typedef {ThreadRuntimeOptions & { threadName?: string | null }} StartThreadOptions
+ * @typedef {{
+ *   onProgress?: ProgressReporter | null,
+ *   model?: string | null,
+ *   threadName?: string | null,
+ *   delivery?: "inline" | "detached",
+ *   target?: ReviewTarget
+ * }} ReviewRunOptions
+ * @typedef {{ onProgress?: ProgressReporter | null, sourcePath?: string }} ImportSessionOptions
+ * @typedef {{
+ *   onProgress?: ProgressReporter | null,
+ *   onActiveTurn?: CaptureTurnOptions["onActiveTurn"],
+ *   resumeThreadId?: string | null,
+ *   model?: string | null,
+ *   sandbox?: ThreadStartParams["sandbox"],
+ *   persistThread?: boolean,
+ *   threadName?: string | null,
+ *   prompt?: string,
+ *   defaultPrompt?: string,
+ *   effort?: string | null,
+ *   outputSchema?: unknown
+ * }} TurnRunOptions
+ * @typedef {{
+ *   loggedIn?: boolean,
+ *   detail?: string,
+ *   source?: string,
+ *   authMethod?: string | null,
+ *   verified?: boolean | null,
+ *   requiresOpenaiAuth?: boolean | null,
+ *   provider?: string | null
+ * }} AuthStatusFields
+ * @typedef {{
+ *   request: AppServerClient["request"],
+ *   close: AppServerClient["close"]
+ * }} AuthStatusClient
+ * @typedef {{
+ *   env?: NodeJS.ProcessEnv,
+ *   availabilityImpl?: typeof getCodexAvailability,
+ *   connectImpl?: (cwd: string, options: { env?: NodeJS.ProcessEnv }) => Promise<AuthStatusClient>
+ * }} AuthStatusOptions
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -40,17 +119,50 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
-import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
-import { binaryAvailable } from "./process.mjs";
+import {
+  AppServerRequestError,
+  CodexAppServerClient
+} from "./app-server.mjs";
+import { binaryAvailable, runCommand } from "./process.mjs";
+import {
+  MINIMUM_CODEX_VERSION,
+  requireMinimumVersion
+} from "./version-support.mjs";
+import {
+  EXTERNAL_AGENT_IMPORT_TIMEOUT_MS,
+  TURN_COMPLETION_CONFIRM_DELAY_MS,
+  TURN_COMPLETION_CONFIRM_POLL_MS,
+  TURN_COMPLETION_CONFIRM_TIMEOUT_MS
+} from "./runtime-config.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
-const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 
+/** @param {unknown} value @returns {value is UnknownRecord} */
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** @param {unknown} value @param {string} key */
+function readStringProperty(value, key) {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return typeof value[key] === "string" ? value[key] : null;
+}
+
+/** @param {unknown} value @param {string} key */
+function readRecordProperty(value, key) {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return isRecord(value[key]) ? value[key] : null;
+}
+
+/** @param {string} stderr */
 function cleanCodexStderr(stderr) {
   return stderr
     .split(/\r?\n/)
@@ -59,7 +171,7 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
-/** @returns {ThreadStartParams} */
+/** @param {string} cwd @param {ThreadRuntimeOptions} [options] @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
   return {
     cwd,
@@ -71,7 +183,7 @@ function buildThreadParams(cwd, options = {}) {
   };
 }
 
-/** @returns {ThreadResumeParams} */
+/** @param {string} threadId @param {string} cwd @param {ThreadRuntimeOptions} [options] @returns {ThreadResumeParams} */
 function buildResumeParams(threadId, cwd, options = {}) {
   return {
     threadId,
@@ -82,11 +194,12 @@ function buildResumeParams(threadId, cwd, options = {}) {
   };
 }
 
-/** @returns {UserInput[]} */
+/** @param {string} prompt @returns {UserInput[]} */
 function buildTurnInput(prompt) {
   return [{ type: "text", text: prompt, text_elements: [] }];
 }
 
+/** @param {unknown} text @param {number} [limit] */
 function shorten(text, limit = 72) {
   const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
   if (!normalized) {
@@ -98,34 +211,45 @@ function shorten(text, limit = 72) {
   return `${normalized.slice(0, limit - 3)}...`;
 }
 
+/** @param {string} command */
 function looksLikeVerificationCommand(command) {
   return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
     command
   );
 }
 
+/** @param {string} prompt */
 function buildTaskThreadName(prompt) {
   const excerpt = shorten(prompt, 56);
   return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 
+/** @param {AppServerNotification} message */
 function extractThreadId(message) {
-  return message?.params?.threadId ?? null;
+  return readStringProperty(message.params, "threadId");
 }
 
+/** @param {AppServerNotification} message */
 function extractTurnId(message) {
-  if (message?.params?.turnId) {
-    return message.params.turnId;
+  const turnId = readStringProperty(message.params, "turnId");
+  if (turnId) {
+    return turnId;
   }
-  if (message?.params?.turn?.id) {
-    return message.params.turn.id;
+  const turn = readRecordProperty(message.params, "turn");
+  const nestedTurnId = readStringProperty(turn, "id");
+  if (nestedTurnId) {
+    return nestedTurnId;
   }
   return null;
 }
 
+/** @param {ThreadItem[]} fileChanges */
 function collectTouchedFiles(fileChanges) {
   const paths = new Set();
   for (const fileChange of fileChanges) {
+    if (fileChange.type !== "fileChange") {
+      continue;
+    }
     for (const change of fileChange.changes ?? []) {
       if (change.path) {
         paths.add(change.path);
@@ -135,10 +259,12 @@ function collectTouchedFiles(fileChanges) {
   return [...paths];
 }
 
+/** @param {unknown} text */
 function normalizeReasoningText(text) {
   return String(text ?? "").replace(/\s+/g, " ").trim();
 }
 
+/** @param {unknown} value @returns {string[]} */
 function extractReasoningSections(value) {
   if (!value) {
     return [];
@@ -153,7 +279,7 @@ function extractReasoningSections(value) {
     return value.flatMap((entry) => extractReasoningSections(entry));
   }
 
-  if (typeof value === "object") {
+  if (isRecord(value)) {
     if (typeof value.text === "string") {
       return extractReasoningSections(value.text);
     }
@@ -171,7 +297,9 @@ function extractReasoningSections(value) {
   return [];
 }
 
+/** @param {string[]} existingSections @param {string[]} nextSections */
 function mergeReasoningSections(existingSections, nextSections) {
+  /** @type {string[]} */
   const merged = [];
   for (const section of [...existingSections, ...nextSections]) {
     const normalized = normalizeReasoningText(section);
@@ -199,6 +327,7 @@ function emitProgress(onProgress, message, phase = null, extra = {}) {
   onProgress({ message, phase, ...extra });
 }
 
+/** @param {ProgressReporter | null | undefined} onProgress @param {ProgressEvent} [options] */
 function emitLogEvent(onProgress, options = {}) {
   if (!onProgress) {
     return;
@@ -213,6 +342,7 @@ function emitLogEvent(onProgress, options = {}) {
   });
 }
 
+/** @param {TurnCaptureState} state @param {string | null | undefined} threadId */
 function labelForThread(state, threadId) {
   if (!threadId || threadId === state.rootThreadId || threadId === state.threadId) {
     return null;
@@ -220,6 +350,7 @@ function labelForThread(state, threadId) {
   return state.threadLabels.get(threadId) ?? threadId;
 }
 
+/** @param {TurnCaptureState} state @param {string} threadId @param {ThreadLabelOptions} [options] */
 function registerThread(state, threadId, options = {}) {
   if (!threadId) {
     return;
@@ -238,6 +369,7 @@ function registerThread(state, threadId, options = {}) {
   }
 }
 
+/** @param {TurnCaptureState} state @param {ThreadItem} item */
 function describeStartedItem(state, item) {
   switch (item.type) {
     case "enteredReviewMode":
@@ -268,6 +400,7 @@ function describeStartedItem(state, item) {
   }
 }
 
+/** @param {TurnCaptureState} state @param {ThreadItem} item */
 function describeCompletedItem(state, item) {
   switch (item.type) {
     case "commandExecution": {
@@ -299,10 +432,12 @@ function describeCompletedItem(state, item) {
   }
 }
 
-/** @returns {TurnCaptureState} */
+/** @param {string} threadId @param {{ onProgress?: ProgressReporter | null }} [options] @returns {TurnCaptureState} */
 function createTurnCaptureState(threadId, options = {}) {
-  let resolveCompletion;
-  let rejectCompletion;
+  /** @type {(state: TurnCaptureState) => void} */
+  let resolveCompletion = () => {};
+  /** @type {(error: unknown) => void} */
+  let rejectCompletion = () => {};
   const completion = new Promise((resolve, reject) => {
     resolveCompletion = resolve;
     rejectCompletion = reject;
@@ -325,6 +460,8 @@ function createTurnCaptureState(threadId, options = {}) {
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
+    completionConfirmationActive: false,
+    confirmCompletion: null,
     lastAgentMessage: "",
     reviewText: "",
     reasoningSummary: [],
@@ -336,6 +473,7 @@ function createTurnCaptureState(threadId, options = {}) {
   };
 }
 
+/** @param {TurnCaptureState} state */
 function clearCompletionTimer(state) {
   if (state.completionTimer) {
     clearTimeout(state.completionTimer);
@@ -343,7 +481,8 @@ function clearCompletionTimer(state) {
   }
 }
 
-function completeTurn(state, turn = null, options = {}) {
+/** @param {TurnCaptureState} state @param {CapturedTurn} turn */
+function completeTurn(state, turn) {
   if (state.completed) {
     return;
   }
@@ -351,26 +490,98 @@ function completeTurn(state, turn = null, options = {}) {
   clearCompletionTimer(state);
   state.completed = true;
 
-  if (turn) {
-    state.finalTurn = turn;
-    if (!state.turnId) {
-      state.turnId = turn.id;
-    }
-  } else if (!state.finalTurn) {
-    state.finalTurn = {
-      id: state.turnId ?? "inferred-turn",
-      status: "completed"
-    };
-  }
-
-  if (options.inferred) {
-    emitProgress(state.onProgress, "Turn completion inferred after the main thread finished and subagent work drained.", "finalizing");
+  state.finalTurn = turn;
+  if (!state.turnId) {
+    state.turnId = turn.id;
   }
 
   state.resolveCompletion(state);
 }
 
-function scheduleInferredCompletion(state) {
+/** @param {number} delayMs */
+function waitForTurnConfirmation(delayMs) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    timer.unref?.();
+  });
+}
+
+/**
+ * @param {AppServerClient} client
+ * @param {TurnCaptureState} state
+ * @param {number} timeoutMs
+ */
+async function readAuthoritativeTurn(client, state, timeoutMs) {
+  let timeout = null;
+  /** @type {Promise<never>} */
+  const deadline = new Promise((resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(
+        new AppServerRequestError(
+          `Timed out while reading authoritative state for turn ${state.turnId}.`
+        )
+      );
+    }, timeoutMs);
+    timeout.unref?.();
+  });
+
+  try {
+    const response = await Promise.race([
+      client.request("thread/read", {
+        threadId: state.threadId,
+        includeTurns: true
+      }),
+      deadline
+    ]);
+    return response.thread.turns.find((turn) => turn.id === state.turnId) ?? null;
+  } finally {
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+/** @param {AppServerClient} client @param {TurnCaptureState} state */
+async function confirmTerminalTurn(client, state) {
+  const deadline = Date.now() + TURN_COMPLETION_CONFIRM_TIMEOUT_MS;
+  let lastObservedStatus = "missing";
+
+  while (!state.completed && Date.now() < deadline) {
+    if (
+      state.pendingCollaborations.size === 0 &&
+      state.activeSubagentTurns.size === 0
+    ) {
+      const turn = await readAuthoritativeTurn(
+        client,
+        state,
+        Math.max(1, deadline - Date.now())
+      );
+      lastObservedStatus = turn?.status ?? "missing";
+      if (turn && turn.status !== "inProgress") {
+        emitProgress(
+          state.onProgress,
+          `Turn ${turn.status} confirmed by thread/read.`,
+          "finalizing"
+        );
+        completeTurn(state, turn);
+        return;
+      }
+    }
+
+    await waitForTurnConfirmation(
+      Math.min(TURN_COMPLETION_CONFIRM_POLL_MS, Math.max(1, deadline - Date.now()))
+    );
+  }
+
+  if (!state.completed) {
+    throw new AppServerRequestError(
+      `Codex did not confirm a terminal state for turn ${state.turnId} within ${TURN_COMPLETION_CONFIRM_TIMEOUT_MS}ms (last observed: ${lastObservedStatus}).`
+    );
+  }
+}
+
+/** @param {TurnCaptureState} state */
+function scheduleCompletionConfirmation(state) {
   if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
     return;
   }
@@ -379,7 +590,9 @@ function scheduleInferredCompletion(state) {
     return;
   }
 
-  clearCompletionTimer(state);
+  if (state.completionTimer || state.completionConfirmationActive) {
+    return;
+  }
   state.completionTimer = setTimeout(() => {
     state.completionTimer = null;
     if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
@@ -388,11 +601,17 @@ function scheduleInferredCompletion(state) {
     if (state.pendingCollaborations.size > 0 || state.activeSubagentTurns.size > 0) {
       return;
     }
-    completeTurn(state, null, { inferred: true });
-  }, 250);
+    state.completionConfirmationActive = true;
+    void state.confirmCompletion?.().catch((error) => {
+      if (!state.completed) {
+        state.rejectCompletion(error);
+      }
+    });
+  }, TURN_COMPLETION_CONFIRM_DELAY_MS);
   state.completionTimer.unref?.();
 }
 
+/** @param {TurnCaptureState} state @param {AppServerNotification} message */
 function belongsToTurn(state, message) {
   const messageThreadId = extractThreadId(message);
   if (!messageThreadId || !state.threadIds.has(messageThreadId)) {
@@ -403,6 +622,7 @@ function belongsToTurn(state, message) {
   return trackedTurnId === null || messageTurnId === null || messageTurnId === trackedTurnId;
 }
 
+/** @param {TurnCaptureState} state @param {ThreadItem} item @param {string} lifecycle @param {string | null} [threadId] */
 function recordItem(state, item, lifecycle, threadId = null) {
   if (item.type === "collabAgentToolCall") {
     if (!threadId || threadId === state.threadId) {
@@ -410,7 +630,7 @@ function recordItem(state, item, lifecycle, threadId = null) {
         state.pendingCollaborations.add(item.id);
       } else if (lifecycle === "completed") {
         state.pendingCollaborations.delete(item.id);
-        scheduleInferredCompletion(state);
+        scheduleCompletionConfirmation(state);
       }
     }
     for (const receiverThreadId of item.receiverThreadIds ?? []) {
@@ -429,7 +649,7 @@ function recordItem(state, item, lifecycle, threadId = null) {
         state.lastAgentMessage = item.text;
         if (lifecycle === "completed" && item.phase === "final_answer") {
           state.finalAnswerSeen = true;
-          scheduleInferredCompletion(state);
+          scheduleCompletionConfirmation(state);
         }
       }
       if (lifecycle === "completed") {
@@ -487,6 +707,7 @@ function recordItem(state, item, lifecycle, threadId = null) {
   }
 }
 
+/** @param {TurnCaptureState} state @param {AppServerNotification} message */
 function applyTurnNotification(state, message) {
   switch (message.method) {
     case "thread/started":
@@ -541,7 +762,7 @@ function applyTurnNotification(state, message) {
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
-        scheduleInferredCompletion(state);
+        scheduleCompletionConfirmation(state);
         break;
       }
       emitProgress(
@@ -556,30 +777,43 @@ function applyTurnNotification(state, message) {
   }
 }
 
+/**
+ * @param {AppServerClient} client
+ * @param {string} threadId
+ * @param {() => Promise<TurnResponse>} startRequest
+ * @param {CaptureTurnOptions} [options]
+ */
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
+  state.confirmCompletion = () => confirmTerminalTurn(client, state);
   const previousHandler = client.notificationHandler;
+  let deactivateActiveTurn = null;
 
-  client.setNotificationHandler((message) => {
-    if (!state.turnId) {
-      state.bufferedNotifications.push(message);
-      return;
-    }
+  client.setNotificationHandler(
+    /** @param {AppServerNotification} message */ (message) => {
+      if (!state.turnId) {
+        state.bufferedNotifications.push(message);
+        return;
+      }
 
-    if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
-      return;
-    }
+      if (
+        message.method === "thread/started" ||
+        message.method === "thread/name/updated"
+      ) {
+        applyTurnNotification(state, message);
+        return;
+      }
 
-    if (!belongsToTurn(state, message)) {
+      if (!belongsToTurn(state, message)) {
         if (previousHandler) {
           previousHandler(message);
         }
         return;
-    }
+      }
 
-    applyTurnNotification(state, message);
-  });
+      applyTurnNotification(state, message);
+    }
+  );
 
   try {
     const response = await startRequest();
@@ -603,61 +837,107 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    if (!state.completed && state.turnId && options.onActiveTurn) {
+      const activeThreadId = state.threadId;
+      const activeTurnId = state.turnId;
+      deactivateActiveTurn = await options.onActiveTurn({
+        threadId: activeThreadId,
+        turnId: activeTurnId,
+        steer: async ({ requestId, instruction }) => {
+          if (state.completed) {
+            throw new Error(`Turn ${activeTurnId} is no longer active.`);
+          }
+          const steerResponse = await client.request("turn/steer", {
+            threadId: activeThreadId,
+            input: buildTurnInput(instruction),
+            expectedTurnId: activeTurnId,
+            clientUserMessageId: requestId
+          });
+          if (
+            typeof steerResponse.turnId !== "string" ||
+            !steerResponse.turnId.trim()
+          ) {
+            throw new AppServerRequestError(
+              "Codex returned a malformed turn/steer acknowledgement."
+            );
+          }
+          if (steerResponse.turnId !== activeTurnId) {
+            throw new AppServerRequestError(
+              `Codex acknowledged turn ${steerResponse.turnId}, expected ${activeTurnId}.`
+            );
+          }
+          return {
+            threadId: activeThreadId,
+            turnId: steerResponse.turnId
+          };
+        }
+      });
+    }
+
+    /** @type {Promise<TurnCaptureState>} */
+    const controlledExit = client.waitForExit().then(() => {
+      throw new Error("Codex app-server exited before the turn completed.");
+    });
+    return await Promise.race([state.completion, controlledExit]);
   } finally {
-    clearCompletionTimer(state);
-    client.setNotificationHandler(previousHandler ?? null);
-  }
-}
-
-async function withAppServer(cwd, fn) {
-  let client = null;
-  try {
-    client = await CodexAppServerClient.connect(cwd);
-    const result = await fn(client);
-    await client.close();
-    return result;
-  } catch (error) {
-    const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
-    const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
-
-    if (client) {
-      await client.close().catch(() => {});
-      client = null;
-    }
-
-    if (!shouldRetryDirect) {
-      throw error;
-    }
-
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
     try {
-      return await fn(directClient);
+      await deactivateActiveTurn?.();
     } finally {
-      await directClient.close();
+      clearCompletionTimer(state);
+      client.setNotificationHandler(previousHandler ?? null);
     }
   }
 }
 
-async function withDirectAppServer(cwd, fn) {
-  const client = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+/**
+ * @template T
+ * @param {string} cwd
+ * @param {(client: AppServerClient) => Promise<T>} fn
+ * @param {(clientCwd: string) => Promise<AppServerClient>} [connectImpl]
+ * @returns {Promise<T>}
+ */
+export async function withAppServer(
+  cwd,
+  fn,
+  connectImpl = (clientCwd) => CodexAppServerClient.connect(clientCwd)
+) {
+  const client = await connectImpl(cwd);
+  /** @type {{ ok: true, value: T } | { ok: false, error: unknown }} */
+  let outcome;
   try {
-    return await fn(client);
-  } finally {
-    await client.close();
+    outcome = { ok: true, value: await fn(client) };
+  } catch (error) {
+    outcome = { ok: false, error };
   }
+
+  try {
+    await client.close();
+  } catch (closeError) {
+    if (!outcome.ok) {
+      throw new AggregateError(
+        [outcome.error, closeError],
+        "Codex app-server operation failed and its process could not be closed."
+      );
+    }
+    throw closeError;
+  }
+
+  if (!outcome.ok) {
+    throw outcome.error;
+  }
+  return outcome.value;
 }
 
 function resolveCodexHome() {
   return path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
 }
 
+/** @param {string} sourcePath */
 function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
+/** @param {string} sourcePath */
 function importedThreadIdForSource(sourcePath) {
   const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
   if (!fs.existsSync(ledgerPath)) {
@@ -666,18 +946,24 @@ function importedThreadIdForSource(sourcePath) {
   const ledger = readJsonFile(ledgerPath);
   const canonicalSource = fs.realpathSync(sourcePath);
   const contentSha256 = sourceContentSha256(canonicalSource);
-  const records = Array.isArray(ledger?.records) ? ledger.records : [];
+  const records = isRecord(ledger) && Array.isArray(ledger.records)
+    ? ledger.records
+    : [];
   const match = records
     .filter(
       (record) =>
-        record?.source_path === canonicalSource &&
-        record?.content_sha256 === contentSha256 &&
-        typeof record?.imported_thread_id === "string"
+        isRecord(record) &&
+        record.source_path === canonicalSource &&
+        record.content_sha256 === contentSha256 &&
+        typeof record.imported_thread_id === "string"
     )
     .at(-1);
-  return match?.imported_thread_id ?? null;
+  return isRecord(match) && typeof match.imported_thread_id === "string"
+    ? match.imported_thread_id
+    : null;
 }
 
+/** @param {string} sourcePath @param {string} cwd @returns {ExternalAgentConfigImportParams} */
 function externalAgentSessionMigration(sourcePath, cwd) {
   return {
     migrationItems: [
@@ -687,6 +973,7 @@ function externalAgentSessionMigration(sourcePath, cwd) {
         cwd: null,
         details: {
           plugins: [],
+          skills: [],
           sessions: [{ path: sourcePath, cwd, title: null }],
           mcpServers: [],
           hooks: [],
@@ -698,37 +985,57 @@ function externalAgentSessionMigration(sourcePath, cwd) {
   };
 }
 
-async function requestExternalAgentSessionImport(client, params) {
+/**
+ * @param {AppServerClient} client
+ * @param {ExternalAgentConfigImportParams} params
+ * @param {number} [timeoutMs]
+ */
+export async function requestExternalAgentSessionImport(
+  client,
+  params,
+  timeoutMs = EXTERNAL_AGENT_IMPORT_TIMEOUT_MS
+) {
   const previousHandler = client.notificationHandler;
   let timeout = null;
-  let resolveCompleted;
-  let rejectCompleted;
-  const completed = new Promise((resolve, reject) => {
+  /** @type {() => void} */
+  let resolveCompleted = () => {};
+  /** @type {Promise<void>} */
+  const completed = new Promise((resolve) => {
     resolveCompleted = resolve;
-    rejectCompleted = reject;
   });
-  void completed.catch(() => {});
+  const deadline = new Promise((resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error("Timed out while importing the Claude session into Codex."));
+    }, timeoutMs);
+  });
 
-  client.setNotificationHandler((message) => {
-    if (message.method === EXTERNAL_AGENT_IMPORT_COMPLETED) {
-      resolveCompleted();
-      return;
+  client.setNotificationHandler(
+    /** @param {AppServerNotification} message */ (message) => {
+      if (message.method === EXTERNAL_AGENT_IMPORT_COMPLETED) {
+        resolveCompleted();
+        return;
+      }
+      previousHandler?.(message);
     }
-    previousHandler?.(message);
-  });
-  timeout = setTimeout(() => {
-    rejectCompleted(new Error("Timed out waiting for Codex to finish importing the Claude session."));
-  }, EXTERNAL_AGENT_IMPORT_TIMEOUT_MS);
+  );
 
   try {
-    await client.request("externalAgentConfig/import", params);
-    await completed;
+    await Promise.race([
+      Promise.all([
+        client.request("externalAgentConfig/import", params),
+        completed
+      ]),
+      deadline
+    ]);
   } finally {
-    clearTimeout(timeout);
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
     client.setNotificationHandler(previousHandler ?? null);
   }
 }
 
+/** @param {AppServerClient} client @param {string} cwd @param {StartThreadOptions} [options] */
 async function startThread(client, cwd, options = {}) {
   const response = await client.request("thread/start", buildThreadParams(cwd, options));
   const threadId = response.thread.id;
@@ -738,7 +1045,7 @@ async function startThread(client, cwd, options = {}) {
     } catch (err) {
       // Only suppress "unknown variant/method" errors from older CLI versions
       // that don't support thread/name/set. Rethrow auth, network, or server errors.
-      const msg = String(err?.message ?? err ?? "");
+      const msg = err instanceof Error ? err.message : String(err ?? "");
       if (!msg.includes("unknown variant") && !msg.includes("unknown method")) {
         throw err;
       }
@@ -747,10 +1054,12 @@ async function startThread(client, cwd, options = {}) {
   return response;
 }
 
+/** @param {AppServerClient} client @param {string} threadId @param {string} cwd @param {ThreadRuntimeOptions} [options] */
 async function resumeThread(client, threadId, cwd, options = {}) {
   return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
 }
 
+/** @param {TurnCaptureState} turnState */
 function buildResultStatus(turnState) {
   return turnState.finalTurn?.status === "completed" ? 0 : 1;
 }
@@ -761,11 +1070,13 @@ const BUILTIN_PROVIDER_LABELS = new Map([
   ["lmstudio", "LM Studio"]
 ]);
 
+/** @param {unknown} value */
 function normalizeProviderId(value) {
   const providerId = typeof value === "string" ? value.trim() : "";
   return providerId || null;
 }
 
+/** @param {string | null} providerId @param {UnknownRecord | null} [providerConfig] */
 function formatProviderLabel(providerId, providerConfig = null) {
   const configuredName = typeof providerConfig?.name === "string" ? providerConfig.name.trim() : "";
   if (configuredName) {
@@ -777,6 +1088,7 @@ function formatProviderLabel(providerId, providerConfig = null) {
   return BUILTIN_PROVIDER_LABELS.get(providerId) ?? providerId;
 }
 
+/** @param {AuthStatusFields} [fields] */
 function buildAuthStatus(fields = {}) {
   return {
     available: true,
@@ -791,9 +1103,10 @@ function buildAuthStatus(fields = {}) {
   };
 }
 
+/** @param {unknown} configResponse */
 function resolveProviderConfig(configResponse) {
-  const config = configResponse?.config;
-  if (!config || typeof config !== "object") {
+  const config = isRecord(configResponse) ? configResponse.config : null;
+  if (!isRecord(config)) {
     return {
       providerId: null,
       providerConfig: null
@@ -801,12 +1114,13 @@ function resolveProviderConfig(configResponse) {
   }
 
   const providerId = normalizeProviderId(config.model_provider);
-  const providers =
-    config.model_providers && typeof config.model_providers === "object" && !Array.isArray(config.model_providers)
-      ? config.model_providers
-      : null;
+  const providers = isRecord(config.model_providers)
+    ? config.model_providers
+    : null;
   const providerConfig =
-    providerId && providers?.[providerId] && typeof providers[providerId] === "object" ? providers[providerId] : null;
+    providerId && providers && isRecord(providers[providerId])
+      ? providers[providerId]
+      : null;
 
   return {
     providerId,
@@ -814,10 +1128,14 @@ function resolveProviderConfig(configResponse) {
   };
 }
 
+/** @param {unknown} accountResponse @param {unknown} configResponse */
 function buildAppServerAuthStatus(accountResponse, configResponse) {
-  const account = accountResponse?.account ?? null;
+  const response = isRecord(accountResponse) ? accountResponse : {};
+  const account = isRecord(response.account) ? response.account : null;
   const requiresOpenaiAuth =
-    typeof accountResponse?.requiresOpenaiAuth === "boolean" ? accountResponse.requiresOpenaiAuth : null;
+    typeof response.requiresOpenaiAuth === "boolean"
+      ? response.requiresOpenaiAuth
+      : null;
   const { providerId, providerConfig } = resolveProviderConfig(configResponse);
   const providerLabel = formatProviderLabel(providerId, providerConfig);
 
@@ -865,6 +1183,7 @@ function buildAppServerAuthStatus(accountResponse, configResponse) {
   });
 }
 
+/** @param {AuthStatusClient} client @param {string} cwd */
 async function getCodexAuthStatusFromClient(client, cwd) {
   try {
     const accountResponse = await client.request("account/read", { refreshToken: false });
@@ -883,10 +1202,19 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
+/** @param {string} cwd */
 export function getCodexAvailability(cwd) {
   const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
   if (!versionStatus.available) {
     return versionStatus;
+  }
+  const supportedVersion = requireMinimumVersion(
+    "Codex",
+    versionStatus.detail,
+    MINIMUM_CODEX_VERSION
+  );
+  if (!supportedVersion.available) {
+    return supportedVersion;
   }
 
   const appServerStatus = binaryAvailable("codex", ["app-server", "--help"], { cwd });
@@ -897,33 +1225,90 @@ export function getCodexAvailability(cwd) {
     };
   }
 
-  return {
-    available: true,
-    detail: `${versionStatus.detail}; advanced runtime available`
-  };
-}
-
-export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
-  if (endpoint) {
-    return {
-      mode: "shared",
-      label: "shared session",
-      detail: "This Claude session is configured to reuse one shared Codex runtime.",
-      endpoint
-    };
+  const schemaDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-plugin-schema-"));
+  try {
+    const generated = runCommand(
+      "codex",
+      ["app-server", "generate-ts", "--out", schemaDirectory],
+      { cwd }
+    );
+    const paramsPath = path.join(schemaDirectory, "v2", "TurnSteerParams.ts");
+    const responsePath = path.join(schemaDirectory, "v2", "TurnSteerResponse.ts");
+    const threadReadParamsPath = path.join(
+      schemaDirectory,
+      "v2",
+      "ThreadReadParams.ts"
+    );
+    const threadReadResponsePath = path.join(
+      schemaDirectory,
+      "v2",
+      "ThreadReadResponse.ts"
+    );
+    const params = fs.existsSync(paramsPath) ? fs.readFileSync(paramsPath, "utf8") : "";
+    const response = fs.existsSync(responsePath) ? fs.readFileSync(responsePath, "utf8") : "";
+    const threadReadParams = fs.existsSync(threadReadParamsPath)
+      ? fs.readFileSync(threadReadParamsPath, "utf8")
+      : "";
+    const threadReadResponse = fs.existsSync(threadReadResponsePath)
+      ? fs.readFileSync(threadReadResponsePath, "utf8")
+      : "";
+    const missingCapabilities = [
+      ...(!params.includes("expectedTurnId") ||
+      !response.includes("turnId")
+        ? ["turn/steer"]
+        : []),
+      ...(!threadReadParams.includes("includeTurns") ||
+      !threadReadResponse.includes("Thread")
+        ? ["thread/read"]
+        : [])
+    ];
+    if (
+      generated.error ||
+      generated.status !== 0 ||
+      generated.signal ||
+      missingCapabilities.length > 0
+    ) {
+      const detail =
+        generated.error?.message ||
+        generated.stderr.trim() ||
+        generated.stdout.trim() ||
+        "generated turn/steer or thread/read schema is missing";
+      const unavailable = missingCapabilities.length > 0
+        ? missingCapabilities
+            .map((capability) => `${capability} capability unavailable`)
+            .join("; ")
+        : "app-server schema generation unavailable";
+      return {
+        available: false,
+        detail: `${supportedVersion.detail}; required ${unavailable}: ${detail}`
+      };
+    }
+  } finally {
+    fs.rmSync(schemaDirectory, { recursive: true, force: true });
   }
 
   return {
+    available: true,
+    detail: `${supportedVersion.detail}; advanced runtime, turn/steer, and thread/read available`
+  };
+}
+
+export function getSessionRuntimeStatus() {
+  return {
     mode: "direct",
-    label: "direct startup",
-    detail: "No shared Codex runtime is active yet. The first review or task command will start one on demand.",
+    label: "direct process per invocation",
+    detail: "Each review or task owns and closes its own Codex runtime.",
     endpoint: null
   };
 }
 
+/** @param {string} cwd @param {AuthStatusOptions} [options] */
 export async function getCodexAuthStatus(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
+  const availabilityImpl = options.availabilityImpl ?? getCodexAvailability;
+  const connectImpl =
+    options.connectImpl ??
+    ((clientCwd, clientOptions) => CodexAppServerClient.connect(clientCwd, clientOptions));
+  const availability = availabilityImpl(cwd);
   if (!availability.available) {
     return {
       available: false,
@@ -937,11 +1322,11 @@ export async function getCodexAuthStatus(cwd, options = {}) {
     };
   }
 
+  /** @type {AuthStatusClient | null} */
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, {
-      env: options.env,
-      reuseExistingBroker: true
+    client = await connectImpl(cwd, {
+      env: options.env
     });
     return await getCodexAuthStatusFromClient(client, cwd);
   } catch (error) {
@@ -952,58 +1337,21 @@ export async function getCodexAuthStatus(cwd, options = {}) {
     });
   } finally {
     if (client) {
-      await client.close().catch(() => {});
+      await client.close();
     }
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
-  if (!threadId || !turnId) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: "missing threadId or turnId"
-    };
-  }
-
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: availability.detail
-    };
-  }
-
-  let client = null;
-  try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
-    await client.request("turn/interrupt", { threadId, turnId });
-    return {
-      attempted: true,
-      interrupted: true,
-      transport: client.transport,
-      detail: `Interrupted ${turnId} on ${threadId}.`
-    };
-  } catch (error) {
-    return {
-      attempted: true,
-      interrupted: false,
-      transport: client?.transport ?? null,
-      detail: error instanceof Error ? error.message : String(error)
-    };
-  } finally {
-    await client?.close().catch(() => {});
-  }
-}
-
+/** @param {string} cwd @param {ReviewRunOptions} options */
 export async function runAppServerReview(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
+  if (!options.target) {
+    throw new Error("A review target is required.");
+  }
+  const target = options.target;
 
   return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
@@ -1026,7 +1374,7 @@ export async function runAppServerReview(cwd, options = {}) {
         client.request("review/start", {
           threadId: sourceThreadId,
           delivery,
-          target: options.target
+          target
         }),
       {
         onProgress: options.onProgress,
@@ -1055,6 +1403,7 @@ export async function runAppServerReview(cwd, options = {}) {
   });
 }
 
+/** @param {string} cwd @param {ImportSessionOptions} options */
 export async function importExternalAgentSession(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1063,13 +1412,17 @@ export async function importExternalAgentSession(cwd, options = {}) {
   if (!options.sourcePath) {
     throw new Error("A Claude session source path is required.");
   }
+  const sourcePath = options.sourcePath;
 
-  return withDirectAppServer(cwd, async (client) => {
+  return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
     try {
-      await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
+      await requestExternalAgentSessionImport(client, externalAgentSessionMigration(sourcePath, cwd));
     } catch (error) {
-      if (error?.rpcCode === -32601) {
+      if (
+        isRecord(error) &&
+        error.rpcCode === -32601
+      ) {
         throw new Error(
           "This Codex version does not support Claude session transfer. Update Codex with `npm install -g @openai/codex@latest`, then retry.",
           { cause: error }
@@ -1077,7 +1430,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
+    const threadId = importedThreadIdForSource(sourcePath);
     if (!threadId) {
       const stderr = cleanCodexStderr(client.stderr);
       throw new Error(
@@ -1092,6 +1445,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
   });
 }
 
+/** @param {string} cwd @param {TurnRunOptions} [options] */
 export async function runAppServerTurn(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1140,7 +1494,10 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        onProgress: options.onProgress,
+        onActiveTurn: options.onActiveTurn
+      }
     );
 
     return {
@@ -1159,6 +1516,7 @@ export async function runAppServerTurn(cwd, options = {}) {
   });
 }
 
+/** @param {string} cwd */
 export async function findLatestTaskThread(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1181,10 +1539,12 @@ export async function findLatestTaskThread(cwd) {
   });
 }
 
+/** @param {string} prompt */
 export function buildPersistentTaskThreadName(prompt) {
   return buildTaskThreadName(prompt);
 }
 
+/** @param {string} rawOutput @param {{ failureMessage?: string, [key: string]: unknown }} [fallback] */
 export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (!rawOutput) {
     return {
@@ -1205,13 +1565,14 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
   } catch (error) {
     return {
       parsed: null,
-      parseError: error.message,
+      parseError: error instanceof Error ? error.message : String(error),
       rawOutput,
       ...fallback
     };
   }
 }
 
+/** @param {string} schemaPath */
 export function readOutputSchema(schemaPath) {
   return readJsonFile(schemaPath);
 }

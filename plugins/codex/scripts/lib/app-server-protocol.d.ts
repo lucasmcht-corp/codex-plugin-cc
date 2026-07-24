@@ -8,6 +8,10 @@ import type {
 import type {
   ExternalAgentConfigImportParams,
   ExternalAgentConfigImportResponse,
+  ConfigReadParams,
+  ConfigReadResponse,
+  GetAccountParams,
+  GetAccountResponse,
   ReviewStartParams,
   ReviewStartResponse,
   ReviewTarget,
@@ -15,6 +19,8 @@ import type {
   ThreadItem,
   ThreadListParams,
   ThreadListResponse,
+  ThreadReadParams,
+  ThreadReadResponse,
   ThreadResumeParams as RawThreadResumeParams,
   ThreadResumeResponse,
   ThreadSetNameParams,
@@ -24,6 +30,8 @@ import type {
   Turn,
   TurnInterruptParams,
   TurnInterruptResponse,
+  TurnSteerParams,
+  TurnSteerResponse,
   TurnStartParams,
   TurnStartResponse,
   UserInput
@@ -31,6 +39,7 @@ import type {
 
 export type {
   ClientInfo,
+  ExternalAgentConfigImportParams,
   InitializeCapabilities,
   InitializeParams,
   InitializeResponse,
@@ -40,6 +49,7 @@ export type {
   ThreadListParams,
   Turn,
   TurnInterruptParams,
+  TurnSteerParams,
   TurnStartParams,
   UserInput
 };
@@ -47,26 +57,27 @@ export type {
 export type ThreadStartParams = Omit<RawThreadStartParams, "persistExtendedHistory">;
 export type ThreadResumeParams = Omit<RawThreadResumeParams, "persistExtendedHistory">;
 
-export interface CodexAppServerClientOptions {
+export type CodexAppServerClientOptions = {
   env?: NodeJS.ProcessEnv;
   clientInfo?: ClientInfo;
   capabilities?: InitializeCapabilities;
-  brokerEndpoint?: string;
-  disableBroker?: boolean;
-  reuseExistingBroker?: boolean;
-}
+};
 
-export interface AppServerMethodMap {
+export type AppServerMethodMap = {
   initialize: { params: InitializeParams; result: InitializeResponse };
+  "account/read": { params: GetAccountParams; result: GetAccountResponse };
+  "config/read": { params: ConfigReadParams; result: ConfigReadResponse };
   "externalAgentConfig/import": { params: ExternalAgentConfigImportParams; result: ExternalAgentConfigImportResponse };
   "thread/start": { params: ThreadStartParams; result: ThreadStartResponse };
   "thread/resume": { params: ThreadResumeParams; result: ThreadResumeResponse };
   "thread/name/set": { params: ThreadSetNameParams; result: ThreadSetNameResponse };
   "thread/list": { params: ThreadListParams; result: ThreadListResponse };
+  "thread/read": { params: ThreadReadParams; result: ThreadReadResponse };
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };
   "turn/start": { params: TurnStartParams; result: TurnStartResponse };
+  "turn/steer": { params: TurnSteerParams; result: TurnSteerResponse };
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResponse };
-}
+};
 
 export type AppServerMethod = keyof AppServerMethodMap;
 export type AppServerRequestParams<M extends AppServerMethod> = AppServerMethodMap[M]["params"];

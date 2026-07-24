@@ -7,6 +7,7 @@ import { ensureAbsolutePath } from "./fs.mjs";
 export const TRANSCRIPT_PATH_ENV = "CODEX_COMPANION_TRANSCRIPT_PATH";
 const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), ".claude", "projects");
 
+/** @param {string} cwd @param {string} value */
 function resolveUserPath(cwd, value) {
   if (value === "~") {
     return os.homedir();
@@ -17,6 +18,10 @@ function resolveUserPath(cwd, value) {
   return ensureAbsolutePath(cwd, value);
 }
 
+/**
+ * @param {string} cwd
+ * @param {{ source?: string }} [options]
+ */
 export function resolveClaudeSessionPath(cwd, options = {}) {
   const requestedPath = options.source || process.env[TRANSCRIPT_PATH_ENV];
   if (!requestedPath) {

@@ -6,7 +6,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs\" SessionStart",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs",
+              "SessionStart"
+            ],
             "timeout": 5
           }
         ]
@@ -17,8 +21,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs\" SessionEnd",
-            "timeout": 5
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs",
+              "SessionEnd"
+            ],
+            "timeout": 10
           }
         ]
       }
@@ -28,8 +36,83 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/stop-review-gate-hook.mjs\"",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/stop-review-gate-hook.mjs"
+            ],
+            "timeout": 930
+          }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "^(codex:)?send$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs",
+              "send-hook"
+            ],
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "^(codex:)?(review|adversarial-review)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs",
+              "review-hook"
+            ],
             "timeout": 900
+          }
+        ]
+      },
+      {
+        "matcher": "^(codex:)?transfer$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs",
+              "command-hook"
+            ],
+            "timeout": 150
+          }
+        ]
+      },
+      {
+        "matcher": "^(codex:)?status$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs",
+              "command-hook"
+            ],
+            "timeout": 900
+          }
+        ]
+      },
+      {
+        "matcher": "^(codex:)?(result|cancel|setup)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs",
+              "command-hook"
+            ],
+            "timeout": 30
           }
         ]
       }

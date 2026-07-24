@@ -9,6 +9,7 @@ export function installFakeCodex(binDir, behavior = "review-ok") {
   const scriptPath = path.join(binDir, "codex");
   const source = `#!/usr/bin/env node
 const fs = require("node:fs");
+const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const path = require("node:path");
 const readline = require("node:readline");
@@ -16,6 +17,13 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	const steerableTurns = new Map();
+	const invalidSteerEnvelopeBehaviors = new Set([
+	  "steer-envelope-null",
+	  "steer-envelope-array",
+	  "steer-envelope-missing-id",
+	  "steer-envelope-wrong-id"
+	]);
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -56,12 +64,20 @@ function buildThread(thread) {
     agentRole: null,
     gitInfo: null,
     name: thread.name || null,
-    turns: []
+    turns: thread.turns || []
   };
 }
 
 function buildTurn(id, status = "inProgress", error = null) {
   return { id, status, items: [], error };
+}
+
+function storeTurn(threadId, turn) {
+  const currentState = loadState();
+  const currentThread = ensureThread(currentState, threadId);
+  currentThread.turns = [turn];
+  currentThread.updatedAt = now();
+  saveState(currentState);
 }
 
 function buildAccountReadResult() {
@@ -171,7 +187,9 @@ function emitTurnCompleted(threadId, turnId, item) {
       send({ method: "item/completed", params: { threadId, turnId, item: entry.completed } });
     }
   }
-  send({ method: "turn/completed", params: { threadId, turn: buildTurn(turnId, "completed") } });
+  const completedTurn = buildTurn(turnId, "completed");
+  storeTurn(threadId, completedTurn);
+  send({ method: "turn/completed", params: { threadId, turn: completedTurn } });
 }
 
 function emitTurnCompletedLater(threadId, turnId, item, delayMs) {
@@ -249,11 +267,40 @@ function taskPayload(prompt, resume) {
 
 const args = process.argv.slice(2);
 if (args[0] === "--version") {
-  console.log("codex-cli test");
+  console.log(BEHAVIOR === "old-codex" ? "codex-cli 0.144.0" : "codex-cli 0.145.0");
   process.exit(0);
 }
 if (args[0] === "app-server" && args[1] === "--help") {
   console.log("fake app-server help");
+  process.exit(0);
+}
+if (args[0] === "app-server" && args[1] === "generate-ts") {
+  const outIndex = args.indexOf("--out");
+  const outputDirectory = outIndex === -1 ? null : args[outIndex + 1];
+  if (!outputDirectory || BEHAVIOR === "missing-turn-steer") {
+    console.error("turn/steer schema unavailable");
+    process.exit(1);
+  }
+  const v2Directory = path.join(outputDirectory, "v2");
+  fs.mkdirSync(v2Directory, { recursive: true });
+  fs.writeFileSync(
+    path.join(v2Directory, "TurnSteerParams.ts"),
+    "export type TurnSteerParams = { threadId: string; expectedTurnId: string };\\n"
+  );
+  fs.writeFileSync(
+    path.join(v2Directory, "TurnSteerResponse.ts"),
+    "export type TurnSteerResponse = { turnId: string };\\n"
+  );
+  if (BEHAVIOR !== "missing-thread-read") {
+    fs.writeFileSync(
+      path.join(v2Directory, "ThreadReadParams.ts"),
+      "export type ThreadReadParams = { threadId: string; includeTurns?: boolean };\\n"
+    );
+    fs.writeFileSync(
+      path.join(v2Directory, "ThreadReadResponse.ts"),
+      "import type { Thread } from './Thread'; export type ThreadReadResponse = { thread: Thread };\\n"
+    );
+  }
   process.exit(0);
 }
 if (args[0] === "login" && args[1] === "status") {
@@ -272,9 +319,52 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+bootState.appServerPid = process.pid;
 saveState(bootState);
 
+if (
+  BEHAVIOR === "initialize-rejects-and-stays-alive" ||
+  BEHAVIOR === "malformed-jsonl-stays-alive" ||
+  BEHAVIOR === "stdin-closes-and-stays-alive"
+) {
+  setInterval(() => {}, 1000);
+}
+if (
+  BEHAVIOR === "term-resistant-app-server" ||
+  BEHAVIOR === "term-resistant-app-server-with-child" ||
+  BEHAVIOR === "term-resistant-slow-task" ||
+  BEHAVIOR === "malformed-jsonl-stays-alive"
+) {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+}
+if (BEHAVIOR === "term-resistant-app-server-with-child") {
+  const child = spawn(
+    process.execPath,
+    ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+    { stdio: "ignore" }
+  );
+  child.unref();
+  const childState = loadState();
+  childState.appServerChildPid = child.pid;
+  saveState(childState);
+}
+
 const rl = readline.createInterface({ input: process.stdin });
+if (BEHAVIOR === "exit-with-late-resistant-child") {
+  rl.on("close", () => {
+    const child = spawn(
+      process.execPath,
+      ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+      { stdio: "ignore" }
+    );
+    child.unref();
+    const childState = loadState();
+    childState.appServerChildPid = child.pid;
+    saveState(childState);
+    process.exit(0);
+  });
+}
 rl.on("line", (line) => {
   if (!line.trim()) {
     return;
@@ -286,12 +376,29 @@ rl.on("line", (line) => {
   try {
     switch (message.method) {
       case "initialize":
+        if (BEHAVIOR === "app-server-initialize-exits") {
+          process.exit(1);
+        }
+        if (BEHAVIOR === "malformed-jsonl-stays-alive") {
+          process.stdout.write("{\\n");
+          break;
+        }
+        if (BEHAVIOR === "initialize-rejects-and-stays-alive") {
+          send({ id: message.id, error: { code: -32000, message: "initialize rejected" } });
+          break;
+        }
         state.capabilities = message.params.capabilities || null;
         saveState(state);
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
         break;
 
       case "initialized":
+        if (BEHAVIOR === "app-server-exits-after-initialize") {
+          setTimeout(() => process.exit(0), 10);
+        }
+        if (BEHAVIOR === "stdin-closes-and-stays-alive") {
+          fs.closeSync(0);
+        }
         break;
 
       case "account/read":
@@ -444,6 +551,7 @@ rl.on("line", (line) => {
           .join("\\n");
         const turnId = nextTurnId(state);
         thread.updatedAt = now();
+        thread.turns = [buildTurn(turnId)];
 	        state.lastTurnStart = {
 	          threadId: message.params.threadId,
 	          turnId,
@@ -452,7 +560,25 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+
+        if (BEHAVIOR === "delayed-turn-start") {
+          state.delayedTurnStartContinued = false;
+          saveState(state);
+          setTimeout(() => {
+            const delayedState = loadState();
+            delayedState.delayedTurnStartContinued = true;
+            saveState(delayedState);
+            send({ id: message.id, result: { turn: buildTurn(turnId) } });
+          }, 600);
+          break;
+        }
+
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+        if (BEHAVIOR === "app-server-exits-after-turn-start") {
+          setTimeout(() => process.exit(0), 10);
+          break;
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
@@ -561,8 +687,10 @@ rl.on("line", (line) => {
               }
             });
           }
+          const completedMainTurn = buildTurn(turnId, "completed");
+          storeTurn(thread.id, completedMainTurn);
           if (BEHAVIOR !== "with-subagent-no-main-turn-completed") {
-            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: completedMainTurn } });
           }
           break;
         }
@@ -585,7 +713,117 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "final-answer-then-delayed-failure") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({
+	            method: "item/completed",
+	            params: {
+	              threadId: thread.id,
+	              turnId,
+	              item: items.at(-1).completed
+	            }
+	          });
+	          setTimeout(() => {
+	            const error = { message: "Delayed terminal failure." };
+	            const failedTurn = buildTurn(turnId, "failed", error);
+	            storeTurn(thread.id, failedTurn);
+	            send({ method: "error", params: { error } });
+	            send({
+	              method: "turn/completed",
+	              params: { threadId: thread.id, turn: failedTurn }
+	            });
+	          }, 600);
+	        } else if (BEHAVIOR === "late-collaboration-after-final-answer") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({
+	            method: "item/completed",
+	            params: {
+	              threadId: thread.id,
+	              turnId,
+	              item: items.at(-1).completed
+	            }
+	          });
+	          setTimeout(() => {
+	            const currentState = loadState();
+	            const subThread = nextThread(currentState, thread.cwd, true);
+	            const subTurnId = nextTurnId(currentState);
+	            send({
+	              method: "thread/started",
+	              params: {
+	                thread: {
+	                  ...buildThread(subThread),
+	                  name: "late-checker",
+	                  agentNickname: "late-checker"
+	                }
+	              }
+	            });
+	            send({
+	              method: "item/started",
+	              params: {
+	                threadId: thread.id,
+	                turnId,
+	                item: {
+	                  type: "collabAgentToolCall",
+	                  id: "late_collab_" + turnId,
+	                  tool: "wait",
+	                  status: "inProgress",
+	                  senderThreadId: thread.id,
+	                  receiverThreadIds: [subThread.id],
+	                  prompt: "Complete the late verification",
+	                  model: null,
+	                  reasoningEffort: null,
+	                  agentsStates: {
+	                    [subThread.id]: {
+	                      status: "inProgress",
+	                      message: "Verifying"
+	                    }
+	                  }
+	                }
+	              }
+	            });
+	            send({
+	              method: "turn/started",
+	              params: {
+	                threadId: subThread.id,
+	                turn: buildTurn(subTurnId)
+	              }
+	            });
+	            setTimeout(() => {
+	              send({
+	                method: "turn/completed",
+	                params: {
+	                  threadId: subThread.id,
+	                  turn: buildTurn(subTurnId, "completed")
+	                }
+	              });
+	              send({
+	                method: "item/completed",
+	                params: {
+	                  threadId: thread.id,
+	                  turnId,
+	                  item: {
+	                    type: "collabAgentToolCall",
+	                    id: "late_collab_" + turnId,
+	                    tool: "wait",
+	                    status: "completed",
+	                    senderThreadId: thread.id,
+	                    receiverThreadIds: [subThread.id],
+	                    prompt: "Complete the late verification",
+	                    model: null,
+	                    reasoningEffort: null,
+	                    agentsStates: {
+	                      [subThread.id]: {
+	                        status: "completed",
+	                        message: "Finished"
+	                      }
+	                    }
+	                  }
+	                }
+	              });
+	              storeTurn(thread.id, buildTurn(turnId, "completed"));
+	            }, 200);
+	          }, 400);
+	        } else if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -600,21 +838,157 @@ rl.on("line", (line) => {
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	          }, 5000);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
-	        } else if (BEHAVIOR === "slow-task") {
+	        } else if (
+	          BEHAVIOR === "steerable-slow-task" ||
+	          BEHAVIOR === "steerable-failing-task" ||
+	          BEHAVIOR === "steer-response-lost" ||
+	          BEHAVIOR === "steer-ack-mismatch" ||
+	          BEHAVIOR === "steer-ack-malformed" ||
+	          invalidSteerEnvelopeBehaviors.has(BEHAVIOR)
+	        ) {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          const activeTurn = {
+	            threadId: thread.id,
+	            instructions: [],
+	            timer: null
+	          };
+	          activeTurn.timer = setTimeout(() => {
+	            if (!steerableTurns.has(turnId)) {
+	              return;
+	            }
+	            steerableTurns.delete(turnId);
+	            if (BEHAVIOR === "steerable-failing-task") {
+	              const error = { message: "Steerable task failed after activation." };
+	              send({ method: "error", params: { error } });
+	              send({
+	                method: "turn/completed",
+	                params: {
+	                  threadId: thread.id,
+	                  turn: buildTurn(turnId, "failed", error)
+	                }
+	              });
+	              const failedState = loadState();
+	              failedState.activeTurnId = null;
+	              saveState(failedState);
+	              return;
+	            }
+	            const finalPayload = [
+	              payload,
+	              ...activeTurn.instructions.map((instruction) => "Steering applied: " + instruction)
+	            ].join("\\n");
+	            send({
+	              method: "item/completed",
+	              params: {
+	                threadId: thread.id,
+	                turnId,
+	                item: {
+	                  type: "agentMessage",
+	                  id: "msg_" + turnId,
+	                  text: finalPayload,
+	                  phase: "final_answer"
+	                }
+	              }
+	            });
+	            send({
+	              method: "turn/completed",
+	              params: { threadId: thread.id, turn: buildTurn(turnId, "completed") }
+	            });
+	            const completedState = loadState();
+	            completedState.activeTurnId = null;
+	            saveState(completedState);
+	          }, BEHAVIOR === "steerable-failing-task" ? 800 : 2500);
+	          steerableTurns.set(turnId, activeTurn);
+	          const activeState = loadState();
+	          activeState.activeTurnId = turnId;
+	          activeState.activeThreadId = thread.id;
+	          saveState(activeState);
+	        } else if (BEHAVIOR === "slow-task" || BEHAVIOR === "term-resistant-slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (BEHAVIOR === "terminal-then-immediate-exit") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          for (const entry of items) {
+	            if (entry && entry.completed) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	            }
+	          }
+	          process.stdout.write(
+	            JSON.stringify({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } }) + "\\n",
+	            () => process.exit(0)
+	          );
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }
 	        break;
 	      }
 
+	      case "thread/read": {
+	        const thread = ensureThread(state, message.params.threadId);
+	        send({ id: message.id, result: { thread: buildThread(thread) } });
+	        break;
+	      }
+
+	      case "turn/steer": {
+	        const activeTurn = steerableTurns.get(message.params.expectedTurnId);
+	        if (
+	          !activeTurn ||
+	          activeTurn.threadId !== message.params.threadId
+	        ) {
+	          throw new Error("expectedTurnId does not match the active turn");
+	        }
+	        const instruction = (message.params.input || [])
+	          .filter((item) => item.type === "text")
+	          .map((item) => item.text)
+	          .join("\\n");
+	        if (!instruction.trim()) {
+	          throw new Error("steering input is empty");
+	        }
+	        activeTurn.instructions.push(instruction);
+	        state.steerCalls = (state.steerCalls || 0) + 1;
+	        state.lastSteer = {
+	          threadId: message.params.threadId,
+	          expectedTurnId: message.params.expectedTurnId,
+	          clientUserMessageId: message.params.clientUserMessageId ?? null,
+	          instruction
+	        };
+	        saveState(state);
+	        if (BEHAVIOR === "steer-response-lost") {
+	          process.exit(0);
+	        }
+	        if (invalidSteerEnvelopeBehaviors.has(BEHAVIOR)) {
+	          const invalidEnvelope = {
+	            "steer-envelope-null": null,
+	            "steer-envelope-array": [],
+	            "steer-envelope-missing-id": { result: {} },
+	            "steer-envelope-wrong-id": { id: "wrong", result: {} }
+	          }[BEHAVIOR];
+	          send(invalidEnvelope);
+	          break;
+	        }
+	        send({
+	          id: message.id,
+	          result:
+	            BEHAVIOR === "steer-ack-malformed"
+	              ? {}
+	              : {
+	                  turnId:
+	                    BEHAVIOR === "steer-ack-mismatch"
+	                      ? "turn_other"
+	                      : message.params.expectedTurnId
+	                }
+	        });
+	        break;
+	      }
+
 	      case "turn/interrupt": {
+	        const pending = interruptibleTurns.get(message.params.turnId);
+	        if (BEHAVIOR === "interruptible-slow-task" && !pending) {
+	          throw new Error("turn is not active in this app-server");
+	        }
 	        state.lastInterrupt = {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
-	        const pending = interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);
 	          interruptibleTurns.delete(message.params.turnId);
@@ -640,12 +1014,23 @@ rl.on("line", (line) => {
 });
 `;
   writeExecutable(scriptPath, source);
+  const claudePath = path.join(binDir, "claude");
+  writeExecutable(
+    claudePath,
+    `#!/usr/bin/env node\nconsole.log(${JSON.stringify(
+      behavior === "old-claude"
+        ? "2.1.217 (Claude Code)"
+        : "2.1.218 (Claude Code)"
+    )});\n`
+  );
 
   // On Windows, npm global binaries are invoked via .cmd wrappers.
   // Create a codex.cmd so the fake binary is discoverable by spawn with shell: true.
   if (process.platform === "win32") {
     const cmdWrapper = `@echo off\r\nnode "%~dp0codex" %*\r\n`;
     fs.writeFileSync(path.join(binDir, "codex.cmd"), cmdWrapper, { encoding: "utf8" });
+    const claudeWrapper = `@echo off\r\nnode "%~dp0claude" %*\r\n`;
+    fs.writeFileSync(path.join(binDir, "claude.cmd"), claudeWrapper, { encoding: "utf8" });
   }
 }
 

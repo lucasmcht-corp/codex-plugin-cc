@@ -4,8 +4,44 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+import { ownedWindowsJobName } from "../plugins/codex/scripts/lib/job-lifecycle.mjs";
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+export function makePosixWorker({
+  pid = 1234,
+  token = "worker-token",
+  startKey = "worker-start",
+  platform = "linux",
+  processGroupId = pid
+} = {}) {
+  return {
+    version: 1,
+    pid,
+    token,
+    startKey,
+    platform,
+    processGroupId
+  };
+}
+
+export function makeWindowsWorker({
+  pid = 1234,
+  token = "worker-token",
+  startKey = "worker-start",
+  jobName = ownedWindowsJobName(token)
+} = {}) {
+  return {
+    version: 2,
+    pid,
+    token,
+    startKey,
+    platform: "win32",
+    processGroupId: null,
+    jobName
+  };
 }
 
 export function writeExecutable(filePath, source) {

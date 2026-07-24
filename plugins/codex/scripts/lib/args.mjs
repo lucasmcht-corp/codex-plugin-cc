@@ -1,8 +1,26 @@
+/**
+ * @typedef {{
+ *   valueOptions?: readonly string[],
+ *   booleanOptions?: readonly string[],
+ *   aliasMap?: Readonly<Record<string, string>>
+ * }} ArgumentParserConfig
+ *
+ * @typedef {Record<string, string | boolean>} ParsedOptions
+ * @typedef {{ value: string, start: number, end: number }} RawArgumentToken
+ */
+
+/**
+ * @param {readonly string[]} argv
+ * @param {ArgumentParserConfig} [config]
+ * @returns {{ options: ParsedOptions, positionals: string[] }}
+ */
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
+  /** @type {ParsedOptions} */
   const options = {};
+  /** @type {string[]} */
   const positionals = [];
   let passthrough = false;
 
@@ -73,56 +91,79 @@ export function parseArgs(argv, config = {}) {
   return { options, positionals };
 }
 
-export function splitRawArgumentString(raw) {
+/** @param {string} raw @returns {RawArgumentToken[]} */
+export function tokenizeRawArgumentString(raw) {
+  /** @type {RawArgumentToken[]} */
   const tokens = [];
-  let current = "";
-  let quote = null;
-  let escaping = false;
+  let index = 0;
 
-  for (const character of raw) {
-    if (escaping) {
-      current += character;
-      escaping = false;
-      continue;
+  while (index < raw.length) {
+    while (index < raw.length && /\s/.test(raw[index])) {
+      index += 1;
+    }
+    if (index >= raw.length) {
+      break;
     }
 
-    if (character === "\\") {
-      escaping = true;
-      continue;
-    }
+    const start = index;
+    let value = "";
+    /** @type {"'" | "\"" | null} */
+    let quote = null;
 
-    if (quote) {
-      if (character === quote) {
-        quote = null;
-      } else {
-        current += character;
+    while (index < raw.length) {
+      const character = raw[index];
+      if (quote !== null) {
+        if (character === quote) {
+          quote = null;
+          index += 1;
+          continue;
+        }
+        if (character === "\\") {
+          const next = raw[index + 1];
+          if (next === quote) {
+            value += next;
+            index += 2;
+            continue;
+          }
+        }
+        value += character;
+        index += 1;
+        continue;
       }
-      continue;
-    }
 
-    if (character === "'" || character === "\"") {
-      quote = character;
-      continue;
-    }
-
-    if (/\s/.test(character)) {
-      if (current) {
-        tokens.push(current);
-        current = "";
+      if (/\s/.test(character)) {
+        break;
       }
-      continue;
+      if (character === "'" || character === "\"") {
+        quote = character;
+        index += 1;
+        continue;
+      }
+      if (character === "\\") {
+        const next = raw[index + 1];
+        if (
+          next !== undefined &&
+          (/\s/.test(next) || next === "'" || next === "\"")
+        ) {
+          value += next;
+          index += 2;
+          continue;
+        }
+      }
+      value += character;
+      index += 1;
     }
 
-    current += character;
-  }
-
-  if (escaping) {
-    current += "\\";
-  }
-
-  if (current) {
-    tokens.push(current);
+    if (quote !== null) {
+      throw new Error("Unterminated quote in raw arguments.");
+    }
+    tokens.push({ value, start, end: index });
   }
 
   return tokens;
+}
+
+/** @param {string} raw */
+export function splitRawArgumentString(raw) {
+  return tokenizeRawArgumentString(raw).map((token) => token.value);
 }

@@ -5,21 +5,33 @@ Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
 
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
-
 ## What You Get
 
 - `/codex:review` for a normal read-only Codex review
-- `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/codex:adversarial-review` for a challenge review with custom focus
+- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, `/codex:send`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+
+This repository is a reliability fork. See [FORK_MAINTENANCE.md](./FORK_MAINTENANCE.md)
+for its scope, upstream synchronization procedure, watchlist, and retirement gates.
 
 ## Requirements
 
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
 - **Node.js 18.18 or later**
+- **Claude Code 2.1.218 or later**
+- **Codex CLI 0.145.0 or later**, with the native `turn/steer` and `thread/read`
+  app-server schemas
+- **Linux or Windows** for this fork. Other POSIX platforms fail closed because
+  their available process start time cannot safely identify a reused PID.
 
-## Install
+## Install the upstream release
+
+The commands in this section install the official OpenAI release, not this
+fork. They are retained only as an upstream reference. The fork checkout must
+not be activated through the official marketplace. Its controlled activation
+starts with the drain and verification procedure in
+[FORK_MAINTENANCE.md](./FORK_MAINTENANCE.md#upgrade-gate-from-v106).
 
 Add the marketplace in Claude Code:
 
@@ -72,6 +84,46 @@ One simple first run is:
 /codex:result
 ```
 
+## Activate this checkout without installing it
+
+This fork has two installation-free entry points. Set the checkout root once:
+
+```bash
+export CODEX_COMPANION_ROOT="$(git rev-parse --show-toplevel)"
+```
+
+For direct runtime commands, the canonical agent-layer wrapper reads that
+variable:
+
+```bash
+codex-companion status --all --json
+```
+
+The wrapper owns its allowed checkout commit and exits with code 3 when
+`CODEX_COMPANION_ROOT` does not match its pinned revision. Update that pin
+deliberately in the agent-layer canon when activating a new fork revision.
+Do not bypass the check or reproduce the wrapper inside this repository.
+Its ownership regression can be rerun against the selected checkout:
+
+```bash
+CODEX_COMPANION_TEST_ROOT="$CODEX_COMPANION_ROOT" \
+  "$HOME/.agents/bin/tests/test-codex-companion-ownership.sh"
+```
+
+For slash commands, hooks, skills, and the rescue agent, load the plugin
+directory for one Claude Code session:
+
+```bash
+claude --plugin-dir "$CODEX_COMPANION_ROOT/plugins/codex"
+```
+
+Claude Code resolves `CLAUDE_PLUGIN_ROOT` inside that plugin's commands and
+hooks to the absolute `"$CODEX_COMPANION_ROOT/plugins/codex"` directory.
+Callers set `CODEX_COMPANION_ROOT`; they do not set
+`CLAUDE_PLUGIN_ROOT` themselves. A successful `/codex:setup` from that session
+proves that the plugin-scoped scripts resolve from the checkout. This path does
+not add a marketplace, install a plugin, or modify the official checkout.
+
 ## Usage
 
 ### `/codex:review`
@@ -100,7 +152,7 @@ This command is read-only and will not perform any changes. When run in the back
 
 ### `/codex:adversarial-review`
 
-Runs a **steerable** review that questions the chosen implementation and design.
+Runs a review that questions the chosen implementation and design. Review jobs are not steerable in this version; native steering is limited to background tasks.
 
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
@@ -206,6 +258,23 @@ Examples:
 /codex:result task-abc123
 ```
 
+### `/codex:send`
+
+Sends a new instruction to the exact active turn of a Codex task.
+The job ID is always required. The command never selects the latest job, starts
+a new Codex process, resumes a thread, or retries an ambiguous delivery.
+Everything after the first separator following the job ID is delivered without
+rewriting its whitespace, quotes, or backslashes. The command hook receives the
+raw arguments directly and never interpolates them into a shell.
+
+```bash
+/codex:send task-abc123 focus on the failing tests first
+```
+
+The command fails when the job is not a running task from the current Claude
+session, when its owned worker generation changed, or when the active turn is no
+longer available.
+
 ### `/codex:cancel`
 
 Cancels an active background Codex job.
@@ -261,6 +330,7 @@ Then check in with:
 
 ```bash
 /codex:status
+/codex:send task-abc123 focus on the failing tests first
 /codex:result
 ```
 
@@ -302,6 +372,7 @@ If you only use Claude Code today and have not used Codex yet, you will also nee
 ### Does the plugin use a separate Codex runtime?
 
 No. This plugin delegates through your local [Codex CLI](https://developers.openai.com/codex/cli/) and [Codex app server](https://developers.openai.com/codex/app-server/) on the same machine.
+Each invocation owns and closes its own local app-server process.
 
 That means:
 
