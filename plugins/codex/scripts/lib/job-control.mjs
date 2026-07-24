@@ -244,17 +244,10 @@ function matchJobReference(jobs, reference, visibleJobs) {
     );
   }
 
+  // Exact equality only: a prefix would let a short reference reach another session's job.
   const exact = jobs.find((job) => job.id === reference);
   if (exact) {
     return exact;
-  }
-
-  const prefixMatches = jobs.filter((job) => job.id.startsWith(reference));
-  if (prefixMatches.length === 1) {
-    return prefixMatches[0];
-  }
-  if (prefixMatches.length > 1) {
-    throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
   }
 
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);

@@ -2897,34 +2897,52 @@ test("targeted status, wait, and result serve a job id held by any session and r
     launchToken: "launch-current",
     launcher: deadLauncher
   });
-  upsertJob(workspace, {
-    id: "task-foreign-dead",
-    status: "queued",
-    jobClass: "task",
-    sessionId: "sess-foreign",
-    launchToken: "launch-foreign",
-    launcher: deadLauncher
-  });
-  upsertJob(workspace, {
-    id: "task-foreign-wait",
-    status: "queued",
-    jobClass: "task",
-    sessionId: "sess-foreign",
-    launchToken: "launch-foreign-wait",
-    launcher: deadLauncher
-  });
-  upsertJob(workspace, {
-    id: "task-foreign-result",
-    status: "completed",
-    jobClass: "task",
-    sessionId: "sess-foreign",
-    rendered: "FOREIGN_RESULT_READ_BY_JOB_ID",
-    result: {
-      codex: {
-        stdout: "FOREIGN_RESULT_READ_BY_JOB_ID"
+  const detachedEnv = { ...process.env };
+  delete detachedEnv.CODEX_COMPANION_SESSION_ID;
+  const callers = [
+    { label: "without any session id", suffix: "detached", env: detachedEnv },
+    {
+      label: "from a restarted session",
+      suffix: "restarted",
+      env: {
+        ...process.env,
+        CODEX_COMPANION_SESSION_ID: "sess-restarted"
       }
     }
-  });
+  ];
+
+  // Each caller reconciles its own untouched fixtures, so no caller inherits another's work.
+  for (const caller of callers) {
+    upsertJob(workspace, {
+      id: `task-foreign-dead-${caller.suffix}`,
+      status: "queued",
+      jobClass: "task",
+      sessionId: "sess-foreign",
+      launchToken: `launch-foreign-${caller.suffix}`,
+      launcher: deadLauncher
+    });
+    upsertJob(workspace, {
+      id: `task-foreign-wait-${caller.suffix}`,
+      status: "queued",
+      jobClass: "task",
+      sessionId: "sess-foreign",
+      launchToken: `launch-foreign-wait-${caller.suffix}`,
+      launcher: deadLauncher
+    });
+    upsertJob(workspace, {
+      id: `task-foreign-result-${caller.suffix}`,
+      status: "completed",
+      jobClass: "task",
+      sessionId: "sess-foreign",
+      rendered: "FOREIGN_RESULT_READ_BY_JOB_ID",
+      result: {
+        codex: {
+          stdout: "FOREIGN_RESULT_READ_BY_JOB_ID"
+        }
+      }
+    });
+  }
+
   const env = {
     ...process.env,
     CODEX_COMPANION_SESSION_ID: "sess-current"
@@ -2937,47 +2955,56 @@ test("targeted status, wait, and result serve a job id held by any session and r
   );
   assert.equal(currentStatus.status, 0, currentStatus.stderr);
   assert.equal(JSON.parse(currentStatus.stdout).job.status, "failed");
-  assert.equal(
-    loadState(workspace).jobs.find((job) => job.id === "task-foreign-dead")
-      .status,
-    "queued"
-  );
+  const afterCurrent = loadState(workspace).jobs;
+  for (const caller of callers) {
+    assert.equal(
+      afterCurrent.find((job) => job.id === `task-foreign-dead-${caller.suffix}`)
+        .status,
+      "queued"
+    );
+  }
 
-  const detachedEnv = { ...process.env };
-  delete detachedEnv.CODEX_COMPANION_SESSION_ID;
-  const restartedEnv = {
-    ...process.env,
-    CODEX_COMPANION_SESSION_ID: "sess-restarted"
-  };
-
-  for (const [caller, callerEnv] of [
-    ["without any session id", detachedEnv],
-    ["from a restarted session", restartedEnv]
-  ]) {
+  for (const caller of callers) {
     const foreignStatus = run(
       "node",
-      [SCRIPT, "status", "task-foreign-dead", "--json"],
-      { cwd: workspace, env: callerEnv }
+      [SCRIPT, "status", `task-foreign-dead-${caller.suffix}`, "--json"],
+      { cwd: workspace, env: caller.env }
     );
-    assert.equal(foreignStatus.status, 0, `status ${caller}: ${foreignStatus.stderr}`);
-    assert.equal(JSON.parse(foreignStatus.stdout).job.status, "failed");
+    assert.equal(foreignStatus.status, 0, `status ${caller.label}: ${foreignStatus.stderr}`);
+    assert.equal(
+      JSON.parse(foreignStatus.stdout).job.status,
+      "failed",
+      `status ${caller.label} did not reconcile the job`
+    );
 
     const foreignWait = run(
       "node",
-      [SCRIPT, "status", "task-foreign-wait", "--wait", "--timeout-ms", "25", "--json"],
-      { cwd: workspace, env: callerEnv }
+      [
+        SCRIPT,
+        "status",
+        `task-foreign-wait-${caller.suffix}`,
+        "--wait",
+        "--timeout-ms",
+        "25",
+        "--json"
+      ],
+      { cwd: workspace, env: caller.env }
     );
-    assert.equal(foreignWait.status, 0, `wait ${caller}: ${foreignWait.stderr}`);
+    assert.equal(foreignWait.status, 0, `wait ${caller.label}: ${foreignWait.stderr}`);
     const waited = JSON.parse(foreignWait.stdout);
-    assert.equal(waited.job.status, "failed");
+    assert.equal(
+      waited.job.status,
+      "failed",
+      `wait ${caller.label} did not reconcile the job`
+    );
     assert.equal(waited.waitTimedOut, false);
 
     const foreignResult = run(
       "node",
-      [SCRIPT, "result", "task-foreign-result", "--json"],
-      { cwd: workspace, env: callerEnv }
+      [SCRIPT, "result", `task-foreign-result-${caller.suffix}`, "--json"],
+      { cwd: workspace, env: caller.env }
     );
-    assert.equal(foreignResult.status, 0, `result ${caller}: ${foreignResult.stderr}`);
+    assert.equal(foreignResult.status, 0, `result ${caller.label}: ${foreignResult.stderr}`);
     assert.equal(
       JSON.parse(foreignResult.stdout).job.result.codex.stdout,
       "FOREIGN_RESULT_READ_BY_JOB_ID"
@@ -3049,6 +3076,72 @@ test("status, result, send, and cancel refuse an omitted or unknown job referenc
       ["job-visible-active", "queued"],
       ["job-visible-done", "completed"]
     ]
+  );
+});
+
+test("status, result, cancel, and send refuse a job id prefix that resolves to a single job", () => {
+  const workspace = makeTempDir();
+  initGitRepo(workspace);
+  upsertJob(workspace, {
+    id: "task-prefix-only",
+    ...activeLauncherFields(),
+    status: "running",
+    jobClass: "task",
+    sessionId: "sess-current",
+    worker: makePosixWorker({ pid: 2147483647, token: "worker-prefix", startKey: "missing-worker" })
+  });
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: "sess-current"
+  };
+
+  for (const args of [
+    ["status", "task-", "--json"],
+    ["result", "task-", "--json"],
+    ["cancel", "task-", "--json"],
+    ["send", "task-", "--json", "instruction"]
+  ]) {
+    const refused = run("node", [SCRIPT, ...args], { cwd: workspace, env });
+    assert.equal(refused.status, 1, `${args[0]} resolved a job id prefix`);
+    assert.match(
+      refused.stderr,
+      /No job found for "task-"|No stored job found for task-/,
+      `${args[0]} did not refuse the prefix`
+    );
+  }
+
+  assert.deepEqual(
+    loadState(workspace).jobs.map((job) => [job.id, job.status]),
+    [["task-prefix-only", "running"]]
+  );
+});
+
+test("cancel reports a job that reconciliation just moved to a terminal status", () => {
+  const workspace = makeTempDir();
+  initGitRepo(workspace);
+  upsertJob(workspace, {
+    id: "task-worker-died",
+    ...activeLauncherFields(),
+    status: "running",
+    jobClass: "task",
+    sessionId: "sess-current",
+    worker: makePosixWorker({ pid: 2147483647, token: "worker-died", startKey: "missing-worker" })
+  });
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: "sess-current"
+  };
+
+  const cancel = run("node", [SCRIPT, "cancel", "task-worker-died", "--json"], {
+    cwd: workspace,
+    env
+  });
+  assert.equal(cancel.status, 1);
+  assert.match(cancel.stderr, /Job task-worker-died is already terminal \(failed\)\./);
+  assert.doesNotMatch(cancel.stderr, /No job found/i);
+  assert.equal(
+    loadState(workspace).jobs.find((job) => job.id === "task-worker-died").status,
+    "failed"
   );
 });
 

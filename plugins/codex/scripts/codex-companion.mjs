@@ -2203,6 +2203,12 @@ async function handleCancel(argv) {
     env: process.env
   });
   reconcileJobRuntime(workspaceRoot, job.id);
+  const reconciled = readStoredJob(workspaceRoot, job.id);
+  if (reconciled && !isActiveJobStatus(reconciled.status)) {
+    throw new Error(
+      `Job ${reconciled.id} is already terminal (${reconciled.status}). Run /codex:status to inspect it.`
+    );
+  }
   ({ workspaceRoot, job } = resolveCancelableJob(cwd, job.id, {
     env: process.env
   }));
