@@ -2,15 +2,26 @@ name: Pull Request CI
 
 on:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   ci:
-    name: CI
-    runs-on: ubuntu-latest
+    name: CI (${{ matrix.os }}, Codex ${{ matrix.codex-version }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            codex-version: 0.145.0
+          - os: ubuntu-latest
+            codex-version: latest
+          - os: windows-latest
+            codex-version: latest
 
     steps:
       - name: Check out repository
@@ -26,7 +37,7 @@ jobs:
         run: npm ci
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex
+        run: npm install -g @openai/codex@${{ matrix.codex-version }}
 
       - name: Run test suite
         run: npm test

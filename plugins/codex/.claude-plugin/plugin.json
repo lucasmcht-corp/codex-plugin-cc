@@ -1,8 +1,8 @@
 {
   "name": "codex",
   "version": "1.0.6",
-  "description": "Use Codex from Claude Code to review code or delegate tasks.",
+  "description": "Reliability fork of OpenAI's Codex plugin for Claude Code.",
   "author": {
-    "name": "OpenAI"
+    "name": "Lucas Michalet"
   }
 }
