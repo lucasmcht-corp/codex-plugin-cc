@@ -80,6 +80,11 @@ function sameLauncherGeneration(left, right) {
   return sameProcessGeneration(left, right);
 }
 
+/** @param {unknown} error */
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /** @param {OwnedWorker | null | undefined} worker @returns {OwnedWorker} */
 function requireOwnedWorker(worker) {
   if (!worker) {
@@ -285,21 +290,11 @@ export function reconcileWorkspaceJobs(workspaceRoot, options = {}) {
       job.cancellation?.token
     ) {
       const cancellationToken = job.cancellation.token;
-      try {
-        cleanupSteeringEndpointImpl(job.steering, {
-          workspaceRoot,
-          jobId: job.id,
-          worker: job.worker,
-          config: options.steeringConfig
-        });
-      } catch {
-        continue;
-      }
       if (remainingBudgetMs(options) <= 0) {
         break;
       }
       const completedAt = new Date().toISOString();
-      mutateJobIfImpl(
+      const cancellation = mutateJobIfImpl(
         workspaceRoot,
         job.id,
         /** @param {JobRecord} current */
@@ -311,12 +306,53 @@ export function reconcileWorkspaceJobs(workspaceRoot, options = {}) {
         () => ({
           status: "cancelled",
           phase: "cancelled",
-          pid: null,
-          worker: null,
-          steering: null,
+          pid: job.steering ? job.pid : null,
+          worker: job.steering ? job.worker : null,
           errorMessage: "Cancelled by user.",
           completedAt,
           cancelledAt: completedAt
+        }),
+        stateMutationOptions(options)
+      );
+      if (
+        !cancellation.matched ||
+        !cancellation.job?.steering ||
+        !cancellation.job.worker
+      ) {
+        continue;
+      }
+      const cancelledJob = cancellation.job;
+      const cancelledWorker = requireOwnedWorker(cancelledJob.worker);
+      const cancelledSteering = cancelledJob.steering;
+
+      try {
+        cleanupSteeringEndpointImpl(cancelledSteering, {
+          workspaceRoot,
+          jobId: cancelledJob.id,
+          worker: cancelledWorker,
+          config: options.steeringConfig
+        });
+      } catch (error) {
+        process.stderr.write(
+          `Steering cleanup deferred for cancelled job ${cancelledJob.id}: ${errorMessage(error)}\n`
+        );
+        continue;
+      }
+      if (remainingBudgetMs(options) <= 0) {
+        break;
+      }
+      mutateJobIfImpl(
+        workspaceRoot,
+        cancelledJob.id,
+        /** @param {JobRecord} current */
+        (current) =>
+          !isActiveJobStatus(current.status) &&
+          current.sessionId === cancelledJob.sessionId &&
+          sameOwnedWorkerGeneration(current.worker, cancelledWorker),
+        () => ({
+          pid: null,
+          worker: null,
+          steering: null
         }),
         stateMutationOptions(options)
       );

@@ -7,6 +7,7 @@ import {
   prepareSessionStart,
   reconcileWorkspaceJobs
 } from "../plugins/codex/scripts/lib/session-cleanup.mjs";
+import { isActiveJobStatus } from "../plugins/codex/scripts/lib/job-lifecycle.mjs";
 import {
   clearSessionEndingsIf,
   createJobIfSessionActive,
@@ -154,6 +155,41 @@ test("reconciliation finalizes an owned user cancellation instead of failing it"
   assert.equal(state.current().phase, "cancelled");
   assert.equal(state.current().worker, null);
   assert.equal(state.current().cancellation.token, "cancel-token");
+});
+
+test("a failing steering cleanup cannot leave a cancelled job active forever", (t) => {
+  const worker = makePosixWorker();
+  const state = createReconciliationState({
+    id: "cancelled-unreachable-steering",
+    status: "cancelling",
+    phase: "cancelling",
+    sessionId: "session-cancel",
+    pid: worker.pid,
+    worker,
+    steering: makeSteering(worker, "/tmp/unreachable/steering.sock"),
+    cancellation: {
+      token: "cancel-token",
+      requestedAt: "2026-07-23T00:00:00.000Z"
+    }
+  });
+  const traces = [];
+  t.mock.method(process.stderr, "write", (chunk) => {
+    traces.push(String(chunk));
+    return true;
+  });
+
+  reconcileWorkspaceJobs("workspace", {
+    ...state,
+    inspectOwnedWorkerImpl: () => ({ status: "gone" }),
+    cleanupSteeringEndpointImpl: () => {
+      throw new Error("EACCES: steering socket root is unreachable");
+    }
+  });
+
+  assert.equal(state.current().status, "cancelled");
+  assert.equal(state.current().phase, "cancelled");
+  assert.equal(isActiveJobStatus(state.current().status), false);
+  assert.match(traces.join(""), /steering cleanup deferred for cancelled job/i);
 });
 
 test("reconciliation fails a dead v1.0.6 worker automatically", () => {
