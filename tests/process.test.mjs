@@ -895,3 +895,34 @@ test("Windows PID reuse after Job Object termination cannot redirect the kill", 
   assert.equal(termination.command, "powershell.exe");
   assert.doesNotMatch(termination.args.join(" "), /1234|taskkill/i);
 });
+
+test("Windows process inspection builds a parseable PowerShell hashtable literal", () => {
+  let script = "";
+  const identity = inspectProcessIdentity(8160, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      assert.equal(command, "powershell.exe");
+      script = args[args.indexOf("-Command") + 1];
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: JSON.stringify({
+          pid: 8160,
+          parentPid: 1,
+          startKey: "637000000000000000",
+          command: "node worker.mjs"
+        }),
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.doesNotMatch(script, /@\{\s*;/);
+  assert.doesNotMatch(script, /;\s*\}/);
+  assert.match(script, /\$value = @\{ pid = /);
+  assert.equal(identity?.pid, 8160);
+  assert.equal(identity?.command, "node worker.mjs");
+});

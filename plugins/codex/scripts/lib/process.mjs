@@ -332,15 +332,16 @@ function inspectPosixProcess(pid, options = {}) {
 function inspectWindowsProcess(pid, options = {}) {
   const runCommandImpl = options.runCommandImpl ?? runCommand;
   const timeout = remainingCommandTimeout(options);
-  const script = [
-    `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"`,
-    "if ($null -eq $p) { exit 3 }",
-    "$value = @{",
+  const hashEntries = [
     "pid = [int]$p.ProcessId",
     "parentPid = [int]$p.ParentProcessId",
     "startKey = [string]$p.CreationDate.ToUniversalTime().Ticks",
-    "command = [string]$p.CommandLine",
-    "}",
+    "command = [string]$p.CommandLine"
+  ].join("; ");
+  const script = [
+    `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"`,
+    "if ($null -eq $p) { exit 3 }",
+    `$value = @{ ${hashEntries} }`,
     "[Console]::Out.Write(($value | ConvertTo-Json -Compress))"
   ].join("; ");
   const result = runCommandImpl(
