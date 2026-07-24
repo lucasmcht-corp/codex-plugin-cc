@@ -73,6 +73,12 @@ document and the repository history.
 21. Persistent state is exported only through
     `CODEX_COMPANION_PLUGIN_DATA`. The plugin-scoped `CLAUDE_PLUGIN_DATA`
     variable is never copied into the global Claude session environment.
+22. A job is owned by its id plus the worker generation proof, never by the
+    Claude session that launched it. `job.sessionId` scopes listings and the
+    SessionEnd boundary only, and never gates access to an explicit job id.
+23. `status <id>`, `status --wait`, `result`, `send` and `cancel` require an
+    explicit job reference. No command resolves an omitted reference to the
+    latest or the only candidate job.
 
 On Windows, opening a directory for synchronization may be unsupported. In that
 case canonical state is kept, but legacy terminal manifests are deliberately
