@@ -3981,7 +3981,11 @@ test("session end drains resistant workers within its bounded shutdown window wi
 
   for (const job of remaining) {
     if (job.worker) {
-      forceStopTestWorker(job.worker);
+      try {
+        forceStopTestWorker(job.worker);
+      } catch {
+        // The worker already died inside the shutdown window.
+      }
     }
   }
 
