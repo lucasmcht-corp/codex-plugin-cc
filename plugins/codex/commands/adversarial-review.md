@@ -5,7 +5,7 @@ disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
-Run an adversarial Codex review through the shared plugin runtime.
+Run an adversarial Codex review through an invocation-owned Codex runtime.
 Position it as a challenge review that questions the chosen implementation, design choices, tradeoffs, and assumptions.
 It is not just a stricter pass over implementation defects.
 
@@ -36,31 +36,50 @@ Execution mode rules:
 
 Argument handling:
 - Preserve the user's arguments exactly.
+- The UserPromptExpansion review hook receives the original raw UTF-8 arguments.
+- When `--wait` or `--background` is explicit, the hook invokes the companion
+  directly in exec form and blocks this prompt expansion with the result.
+- Without an explicit mode, the hook injects one line shaped exactly like
+  `Deterministic review transport: {"argumentsBase64":"..."}`.
+- After the user chooses a mode, copy only the injected `argumentsBase64` value
+  through `--arguments-base64`. Omit the option when that value is empty.
+- Never compute, rewrite, or guess the base64 value yourself.
+- Never put the raw arguments in a Bash command.
+- Never write an argument file.
 - Do not strip `--wait` or `--background` yourself.
 - Do not weaken the adversarial framing or rewrite the user's focus text.
-- The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
+- The companion script uses `--background` to create the owned detached worker. Claude Code may run the short launch command in a background Bash task.
 - `/codex:adversarial-review` uses the same review target selection as `/codex:review`.
 - It supports working-tree review, branch review, and `--base <ref>`.
 - It does not support `--scope staged` or `--scope unstaged`.
 - Unlike `/codex:review`, it can still take extra focus text after the flags.
 
 Foreground flow:
-- Run:
+- This flow is reached only after the interactive choice. For a non-empty
+  injected `argumentsBase64` value, replace the unmistakable placeholder with
+  that exact value, then run:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review --arguments-base64 CANONICAL_BASE64_OF_EXACT_RAW_ARGUMENTS
+```
+- For empty raw arguments, run:
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review
 ```
 - Return the command stdout verbatim, exactly as-is.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 
 Background flow:
-- Launch the review with `Bash` in the background:
+- This flow is reached only after the interactive choice. For a non-empty
+  injected `argumentsBase64` value, replace the unmistakable placeholder with
+  that exact value, then launch the review with `Bash` in the background:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"`,
+  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review --background --arguments-base64 CANONICAL_BASE64_OF_EXACT_RAW_ARGUMENTS`,
   description: "Codex adversarial review",
   run_in_background: true
 })
 ```
+- For empty raw arguments, omit `--arguments-base64` from the command.
 - Do not call `BashOutput` or wait for completion in this turn.
 - After launching the command, tell the user: "Codex adversarial review started in the background. Check `/codex:status` for progress."
